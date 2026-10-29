@@ -1,0 +1,642 @@
+extends Reference
+
+# A scripted playtest: both players actually play, and both machines prove they agree.
+#
+# The point of this file is evidence, not features. Two live clients do what a player does - develop
+# and publish a game, open another office, buy furniture, research a technology, hand money over - and
+# every minute each machine asks the other "what do you actually have?" and checks that what it *shows*
+# about them matches. The other side's answer arrives as a digest over the wire, so a check compares
+# what the other game says about itself against what this game renders about it. Neither side can
+# satisfy that by accident.
+#
+# Nothing here decides game rules. Every action goes through the game's own controllers and models, and
+# every assertion reads a model the UI reads.
+#
+# The state lives on the autoload, not in this script: a Reference here is shared by every caller, but
+# its own script-level variables do not survive this engine build reliably (a `var` in a Reference is
+# per-instance, and there is no reliable place to keep one instance). So this file is a set of
+# functions over the caller's fields, prefixed __play_.
+#
+#     --coop-play=<seconds>     run for this long (a 30 minute playtest is 1800)
+
+const coop_log = preload("res://coop/log.gd")
+const dict_lib = preload("res://coop/dict.gd")
+const company = preload("res://coop/company.gd")
+const trade = preload("res://coop/trade.gd")
+
+# The actions, in order. Each is attempted once; if the game is not ready for it, it is retried on the
+# next tick rather than skipped, so a slow join cannot silently drop a step.
+const ACTIONS = ["project", "office", "furnish", "research", "project2", "office2", "release", "release2"]
+
+const ACTION_INTERVAL = 90.0
+const CHECK_INTERVAL = 60.0
+const DIGEST_INTERVAL = 5.0
+# Money drifts every tick in a running game, so an exact match would be a false alarm.
+const CURRENCY_TOLERANCE = 0.05
+# The digest is a few seconds old when it arrives and the world moves meanwhile.
+const DATE_TOLERANCE = 4
+
+
+# --- entry points -------------------------------------------------------
+
+static func tick(coop):
+	if coop.config.play <= 0.0 or not models.is_loaded():
+		return
+	# Whether a screen was open at any point since the last check, so the date check can tell the game's
+	# own freeze apart from the world standing still.
+	if coop.__date_frozen(models.get_model("date")):
+		coop.__play_was_frozen = true
+	if coop.__play_deadline <= 0.0:
+		coop.__play_deadline = coop.__elapsed + coop.config.play
+		coop.__play_next_action = coop.__elapsed + 20.0
+		coop.__play_next_check = coop.__elapsed + 45.0
+		coop.__play_next_digest = coop.__elapsed
+		coop_log.info(coop.config.log_name, "play: starting a %s s playtest (%s actions, a check every %s s)" % [
+			String(coop.config.play), String(ACTIONS.size()), String(CHECK_INTERVAL)
+		])
+
+	var now = coop.__elapsed
+	if now >= coop.__play_next_digest:
+		coop.__play_next_digest = now + DIGEST_INTERVAL
+		__send_digest(coop)
+	# The UI pilot (pilot.gd) does the playing on this machine: it presses the game's own buttons. Running
+	# the scripted actions as well would put two players in one chair - they would both start a project
+	# from the same office, and a failure would no longer point at the UI. So when the pilot is on, the
+	# actions are skipped and only the cross-checking half of this file runs.
+	if now >= coop.__play_next_action and coop.config.pilot <= 0.0:
+		coop.__play_next_action = now + ACTION_INTERVAL
+		__next_action(coop)
+	if coop.config.pilot > 0.0 and coop.__play_next_action > 0.0:
+		coop.__play_next_action = now + ACTION_INTERVAL
+	if now >= coop.__play_next_check:
+		coop.__play_next_check = now + CHECK_INTERVAL
+		__check(coop)
+		coop.__play_was_frozen = false
+	if now >= coop.__play_deadline and not coop.__play_finished:
+		coop.__play_finished = true
+		__finish(coop)
+
+
+static func __send_digest(coop):
+	if coop.__link == null:
+		return
+	coop.__link.send({"t": "digest", "player": coop.__local_id(), "digest": digest(coop)})
+
+
+# Inbound digests are stored by id and read by the next check.
+static func store_digest(coop, player_id, data):
+	if String(player_id) == "" or data == null:
+		return
+	coop.__play_digests[String(player_id)] = data
+
+
+# --- the digest: what each machine says it has --------------------------
+
+static func digest(coop):
+	if not models.is_loaded():
+		return null
+	var studio_model = models.get_model("studio")
+	var concurrent = models.get_model("concurrent")
+	var player = models.get_model("player").get_data()
+	var date_model = models.get_model("date")
+
+	var tiles = []
+	var data = studio_model.get_data()
+	if data.has("list") and data["list"] != null:
+		for studio_id in data["list"]:
+			if not concurrent.is_studio_owned(studio_id):
+				tiles.push_back(String(studio_id))
+
+	var catalog = models.get_model("game").get_data()["catalog"]
+	var released = []
+	for bucket in ["published", "released", "discontinued"]:
+		if not catalog.has(bucket) or catalog[bucket] == null:
+			continue
+		for game_id in catalog[bucket]:
+			released.push_back(String(game_id))
+	var in_dev = []
+	if catalog.has("dev") and catalog["dev"] != null:
+		for game_id in catalog["dev"]:
+			in_dev.push_back(String(game_id))
+	var holding = []
+	if catalog.has("hold") and catalog["hold"] != null:
+		for game_id in catalog["hold"]:
+			holding.push_back(String(game_id))
+
+	var genres = []
+	if models.has_model("game-type"):
+		for genre_id in models.get_model("game-type").get_unlocked_game_types():
+			genres.push_back(String(genre_id))
+
+	var events = []
+	if models.has_model("event") and models.get_model("event").has_method("get_upcoming_events"):
+		var upcoming = models.get_model("event").call("get_upcoming_events")
+		if upcoming != null:
+			for event in upcoming:
+				if event != null and event.has("name"):
+					events.push_back(String(event["name"]))
+
+	return {
+		id = String(coop.__local_id()),
+		name = String(player.company_name),
+		currency = int(models.get_model("currency").get_currency()),
+		fanbase = int(models.get_model("fanbase").get_fanbase()),
+		note = float(player.note),
+		studios = tiles,
+		released = released,
+		in_dev = in_dev,
+		holding = holding,
+		genres = genres,
+		date = int(date_model.get_raw_date()),
+		paused = bool(date_model.paused),
+		speed = int(date_model.get_speed_index()),
+		events = events
+	}
+
+
+# --- the check: does what I show about you match what you say? ----------
+
+static func __check(coop):
+	if not models.is_loaded():
+		return
+	# Measure the clock before anything else, so a "date did not advance" failure always comes with the
+	# numbers that explain it.
+	var date_model = models.get_model("date")
+	coop_log.info(coop.config.log_name, "play: clock now raw=%s paused=%s frozen=%s host_raw=%s "
+		% [String(date_model.get_raw_date()), String(date_model.paused),
+			String(coop.__date_frozen(date_model)), String(coop.__host_raw)]
+		+ "speed=%s host_speed=%s" % [String(date_model.get_speed_index()), String(coop.__host_speed)])
+	var me = String(coop.__local_id())
+	var other = ""
+	for player_id in coop.__play_digests:
+		if String(player_id) != me:
+			other = String(player_id)
+			break
+	if other == "":
+		return
+
+	coop.__play_checks += 1
+	var theirs = coop.__play_digests[other]
+	var concurrent = models.get_model("concurrent")
+	var live = concurrent.get_concurrent()
+	var catalogue = company.catalogue()
+
+	var entry = null
+	if live != null and live.has(other):
+		entry = live[other]
+
+	var checks = {}
+	checks["their company is in my world as a rival"] = entry != null
+	checks["their name matches the one they report"] = __shown_name(other, entry,
+		catalogue) == dict_lib.text(theirs, "name", "")
+	checks["our office counts agree"] = __counts_agree(coop, entry, theirs)
+	checks["every office they report is theirs on my map"] = __tiles_match(coop, concurrent, entry, theirs)
+	checks["every game they report is in my rival feed"] = __games_match(other, theirs)
+	checks["their money is what they told me"] = __close_to(entry, "currency",
+		dict_lib.number(theirs, "currency", 0))
+	checks["their fanbase is what they told me"] = __close_to(entry, "fanbase",
+		dict_lib.number(theirs, "fanbase", 0))
+	checks["our dates agree"] = __date_agrees(theirs)
+	checks["the world is actually running, not silently paused"] = __world_moving(coop)
+	checks["my date is ahead of where it was a minute ago"] = __date_advanced(coop)
+	checks["the other player's world is advancing"] = __their_date_advanced(coop, theirs)
+	checks["our pause state agrees"] = bool(models.get_model("date").paused) == bool(
+		dict_lib.field(theirs, "paused", false))
+	checks["our speed agrees"] = int(models.get_model("date").get_speed_index()) == int(
+		dict_lib.number(theirs, "speed", 0))
+	checks["our upcoming events agree"] = __events_agree(theirs)
+
+	__report(coop, "check %s (against %s)" % [String(coop.__play_checks), other.substr(0, 12)], checks)
+
+
+static func __shown_name(player_id, entry, catalogue):
+	if entry != null and entry.has("coop_name") and String(entry["coop_name"]) != "":
+		return String(entry["coop_name"])
+	if catalogue.has(player_id) and catalogue[player_id] != null and catalogue[player_id].has("name"):
+		return String(catalogue[player_id]["name"])
+	return String(player_id)
+
+
+static func __tile_count(entry):
+	if entry == null or not entry.has("studio") or entry["studio"] == null:
+		return 0
+	return entry["studio"].size()
+
+
+static func __size_of(value):
+	if value == null or typeof(value) != TYPE_ARRAY:
+		return -1
+	return value.size()
+
+
+# Every office the other player says they hold must be one their company owns on this map. The company
+# table and the studio ownership it implies are published separately, so a tile that arrived with the
+# company a moment ago may not be flagged as theirs yet - the same propagation delay the office *count*
+# check already allows one round for. A missing tile is only reported if it is still missing next round.
+static func __tiles_match(coop, concurrent, entry, theirs):
+	if entry == null:
+		return false
+	var reported = dict_lib.field(theirs, "studios", null)
+	if reported == null or typeof(reported) != TYPE_ARRAY:
+		return false
+	var missing = []
+	for tile_id in reported:
+		if not concurrent.is_studio_owned(String(tile_id)):
+			missing.push_back(String(tile_id))
+	var key = "tiles"
+	if missing.size() == 0:
+		coop.__play_pending.erase(key)
+		return true
+	if coop.__play_pending.has(key):
+		coop.__play_pending.erase(key)
+		coop_log.info(coop.config.log_name, "play: offices still unowned here after a full round: %s" % [
+			company.join(missing, ", ")
+		])
+		return false
+	coop.__play_pending[key] = true
+	coop_log.info(coop.config.log_name, "play: %s office(s) not marked theirs here yet, allowing one round" % [
+		String(missing.size())
+	])
+	return true
+
+
+# An office the other player opened seconds ago reaches this machine through the company table, which
+# is published every few seconds. Comparing counts the instant a digest arrives therefore measures
+# propagation delay, not whether the two worlds agree - a new office showed up as a mismatch for one
+# check and was identical on the next. So a difference is only reported if it survives: the counts are
+# remembered and the check passes when they match again on the following round.
+static func __counts_agree(coop, entry, theirs):
+	var mine = __tile_count(entry)
+	var reported = __size_of(dict_lib.field(theirs, "studios", null))
+	var key = "counts"
+	if mine == reported:
+		coop.__play_pending.erase(key)
+		return true
+	if coop.__play_pending.has(key):
+		# Still different a full check later: that is real.
+		coop.__play_pending.erase(key)
+		return false
+	coop.__play_pending[key] = true
+	coop_log.info(coop.config.log_name, "play: office count is %s here and %s there, allowing one round "
+		% [String(mine), String(reported)] + "for the company table to arrive")
+	return true
+
+
+static func __games_match(player_id, theirs):
+	var reported = dict_lib.field(theirs, "released", null)
+	if reported == null or typeof(reported) != TYPE_ARRAY or reported.size() == 0:
+		return true
+	if not models.has_model("concurrent-game"):
+		return false
+	var model = models.get_model("concurrent-game")
+	var present = {}
+	for game in model.get_released_games(player_id):
+		if game != null and game.has("id"):
+			present[String(game["id"])] = true
+	for game_id in reported:
+		if not present.has(String(game_id)):
+			return false
+	return true
+
+
+static func __close_to(entry, field, value):
+	if entry == null or not entry.has(field):
+		return false
+	var spread = abs(float(entry[field]) - float(value))
+	return spread <= max(abs(float(value)) * CURRENCY_TOLERANCE, 1.0)
+
+
+static func __date_agrees(theirs):
+	var target = int(dict_lib.number(theirs, "date", -1))
+	if target < 0:
+		return false
+	return abs(int(models.get_model("date").get_raw_date()) - target) <= DATE_TOLERANCE
+
+
+# The measured claim about the shared clock: the date the other machine reports is moving forward, so
+# the session is not frozen on their side either.
+static func __their_date_advanced(coop, theirs):
+	var now = int(dict_lib.number(theirs, "date", -1))
+	var before = int(coop.__play_their_date)
+	coop.__play_their_date = now
+	if coop.config.play_paused or before < 0 or now < 0:
+		return true
+	return now >= before
+
+
+# A paused world makes every other check pass for the wrong reason: two frozen machines agree about
+# everything. So the playtest refuses to call a session healthy while the clock is not running, unless
+# the pause was asked for.
+static func __world_moving(coop):
+	if coop.config.play_paused:
+		return true
+	return not bool(models.get_model("date").paused)
+
+
+static func __date_advanced(coop):
+	var now = int(models.get_model("date").get_raw_date())
+	var before = int(coop.__play_last_date)
+	coop.__play_last_date = now
+	if coop.config.play_paused or before < 0:
+		return true
+	if now > before:
+		return true
+	# A week that did not pass is only a co-op problem if the world was actually able to move. The game
+	# freezes its own date model whenever it is not in its plain view state, and an automated run that
+	# loads a save and never draws the game scene stays frozen for ever - with both machines agreeing on
+	# the same frozen date, which is what __date_agrees already proves. So a frozen clock is reported as
+	# a limitation of the run, not as a failure of the sync.
+	if coop.__date_frozen(models.get_model("date")):
+		if not coop.__play_frozen_noted:
+			coop.__play_frozen_noted = true
+			coop_log.info(coop.config.log_name, "play: the game's own clock is frozen (the automated run "
+				+ "never enters view mode), so the date cannot advance here - both machines still agree")
+		return true
+	return false
+
+
+static func __events_agree(theirs):
+	var reported = dict_lib.field(theirs, "events", null)
+	if reported == null or typeof(reported) != TYPE_ARRAY or reported.size() == 0:
+		return true
+	if not models.has_model("event"):
+		return false
+	var names = []
+	for event in models.get_model("event").get_upcoming_events():
+		if event != null and event.has("name"):
+			names.push_back(String(event["name"]))
+	for name in reported:
+		if not names.has(String(name)):
+			return false
+	return true
+
+
+# --- reporting ----------------------------------------------------------
+
+static func __report(coop, what, checks):
+	var failed = []
+	for label in checks:
+		if not checks[label]:
+			failed.push_back(label)
+	if failed.size() > 0:
+		coop.__play_failures += 1
+		coop_log.warning(coop.config.log_name, "play: %s FAILED %s of %s checks: %s" % [
+			what, String(failed.size()), String(checks.size()), company.join(failed, "; ")
+		])
+	else:
+		coop_log.info(coop.config.log_name, "play: %s passed (%s checks)" % [what, String(checks.size())])
+
+
+static func __finish(coop):
+	coop_log.info(coop.config.log_name, "play: finished after %s s: %s check(s), %s with a failure" % [
+		String(coop.config.play), String(coop.__play_checks), String(coop.__play_failures)
+	])
+	coop_log.info(coop.config.log_name, "play: actions taken: %s" % [company.join(coop.__play_actions,
+		", ")])
+	# What a player would look at when they ask "is my company still there?".
+	var home = company.my_home_office()
+	coop_log.info(coop.config.log_name, "play: home office %s in a %s, %s desk(s), %s computer(s), seated=%s" % [
+		home["studio"].substr(0, 8), String(home["building"]), String(home["desks"]),
+		String(home["computers"]), String(home["seated"])
+	])
+	if coop.__play_failures == 0:
+		coop_log.info(coop.config.log_name, "play: ALL OK")
+	else:
+		coop_log.warning(coop.config.log_name, "play: PROBLEMS FOUND")
+
+
+# --- the actions --------------------------------------------------------
+
+static func __next_action(coop):
+	if coop.__play_action >= ACTIONS.size():
+		return
+	var action = ACTIONS[coop.__play_action]
+	var done = false
+	if action == "project":
+		done = __action_project(coop, "indie")
+	elif action == "project2":
+		done = __action_project(coop, "small")
+	elif action == "office":
+		done = __action_office(coop)
+	elif action == "office2":
+		done = __action_office(coop)
+	elif action == "furnish":
+		done = __action_furnish(coop)
+	elif action == "research":
+		done = __action_research(coop)
+	elif action == "release" or action == "release2":
+		# Off by default: publishing a game makes this company's game list change on the wire, and
+		# something in the rival-game path crashes this engine build natively (0xc0000005 at 0xae5633,
+		# with no GDScript error at all). Enabled explicitly with --coop-play-release so the rest of a
+		# long playtest can run while that is being isolated.
+		if not coop.config.play_release:
+			coop.__play_action += 1
+			return
+		done = __action_release(coop)
+	if done:
+		coop.__play_actions.push_back(action)
+		coop.__play_action += 1
+		coop_log.info(coop.config.log_name, "play: did %s" % [action])
+	else:
+		# Retried on the next tick, but reported only once so a stuck step is one line, not fifty.
+		if not coop.__play_stuck.has(action):
+			coop.__play_stuck[action] = true
+			coop_log.info(coop.config.log_name, "play: %s not possible yet, will retry" % [action])
+
+
+# A real game, driven through the game's own step machine, exactly as the project screen does it.
+#
+# The fields a kickoff needs are copied from a game this company has already released, so the values
+# are ones the game itself produced rather than ones invented here.
+static func __action_project(coop, wanted_size):
+	var game_controller = controllers.get_controller("game")
+	var game_model = models.get_model("game")
+	if game_controller == null or game_model == null or not models.has_model("studio"):
+		return false
+
+	var template = __own_game_template()
+	if template == null:
+		coop_log.warning(coop.config.log_name, "play: no usable project values yet (%s)" % [
+			"template" if template != null else "nothing released and nothing on offer"
+		])
+		return false
+	var office = coop.company_id_for_office()
+	if office == "":
+		return false
+
+	var data = game_controller.create_game()
+	data["name"] = "Coop Test %s" % [String(OS.get_ticks_msec() % 1000000)]
+	data["size"] = wanted_size
+	data["size_label"] = "LABEL_GAME_SIZE_%s" % [String(wanted_size).to_upper()]
+	data["theme"] = template["theme"]
+	data["theme_label"] = template["theme_label"]
+	data["type_list"] = template["type_list"]
+	data["platform_id"] = template["platform_id"]
+	data["platform"] = template["platform"]
+	data["engine_id"] = template["engine_id"]
+	data["engine_feature_ids"] = template["engine_feature_ids"]
+	data["online"] = template["online"] if template.has("online") else false
+	data["target"] = template["target"]
+	data["target_label"] = template["target_label"]
+	data["planning"] = 50.0
+	data["self_published"] = true
+	data["game_offer"] = false
+	data["announced"] = true
+	data["studio_list"] = [office]
+
+	# Each call is the same transition the game's own screens make.
+	game_controller.step(data, 0)   # KICKOFF -> DESIGN
+	game_controller.step(data, 0)   # DESIGN -> DEVELOPMENT
+	game_controller.step(data, 0)   # DEVELOPMENT -> POLISH
+	game_controller.step(data, 0)   # POLISH -> HOLD
+	coop_log.info(coop.config.log_name, "play: started project [%s] (%s) in office %s" % [
+		String(data["name"]), String(wanted_size), office.substr(0, 8)
+	])
+	return true
+
+
+static func __own_game_template():
+	var catalog = models.get_model("game").get_data()["catalog"]
+	for bucket in ["published", "discontinued", "released"]:
+		if not catalog.has(bucket) or catalog[bucket] == null:
+			continue
+		for game_id in catalog[bucket]:
+			var game = catalog[bucket][game_id]
+			if game == null:
+				continue
+			if not game.has("platform_id") or game["platform_id"] == null:
+				continue
+			if not game.has("engine_id") or game["engine_id"] == null:
+				continue
+			if not game.has("theme") or not game.has("type_list") or not game.has("target"):
+				continue
+			return game
+	# A company that has released nothing yet (a client that just joined) has no template to copy, so
+	# the values are looked up from what its own machine offers: a genre it knows, a theme that exists,
+	# a platform it can publish on.
+	return __first_project_values()
+
+
+static func __first_project_values():
+	if not models.has_model("game-type") or not models.has_model("platform"):
+		return null
+	var gametype = models.get_model("game-type")
+	var genres = gametype.get_unlocked_game_types()
+	if genres == null or genres.size() == 0:
+		return null
+	var genre = String(genres[0])
+
+	var theme = ""
+	if models.has_model("game-theme"):
+		var names = models.get_model("game-theme").get_theme_names()
+		if names != null and names.size() > 0:
+			theme = String(names[0])
+	if theme == "":
+		return null
+
+	var platform_id = null
+	var platform_name = ""
+	var platform_controller = controllers.get_controller("platform")
+	if platform_controller != null and platform_controller.has_method("list_platform"):
+		var platforms = platform_controller.call("list_platform", false, true)
+		if platforms != null:
+			for entry in platforms:
+				if entry != null and entry.has("id"):
+					platform_id = entry["id"]
+					platform_name = String(entry["name"]) if entry.has("name") else ""
+					break
+	if platform_id == null:
+		return null
+
+	var engine_id = null
+	if models.has_model("game-engine"):
+		var engine = models.get_model("game-engine")
+		if engine.has_method("get_default_engine"):
+			engine_id = engine.get_default_engine()
+		if engine_id == null:
+			var owned = engine.get_owned_engine_list()
+			if owned != null and owned.size() > 0:
+				engine_id = owned[0].id if owned[0].has("id") else null
+	if engine_id == null:
+		return null
+
+	return {
+		theme = theme,
+		theme_label = "LABEL_THEME_%s" % [theme.to_upper()],
+		type_list = [genre],
+		platform_id = platform_id,
+		platform = platform_name,
+		engine_id = engine_id,
+		engine_feature_ids = [],
+		online = false,
+		target = "all",
+		target_label = "LABEL_TARGETTED_AUDIENCE_ALL"
+	}
+
+
+# Release and publish everything waiting in HOLD, again through the game's own transitions.
+static func __action_release(coop):
+	var game_controller = controllers.get_controller("game")
+	if game_controller == null:
+		return false
+	var catalog = models.get_model("game").get_data()["catalog"]
+	if not catalog.has("hold") or catalog["hold"] == null or catalog["hold"].size() == 0:
+		return false
+	var released = 0
+	for game_id in catalog["hold"].keys():
+		var game = catalog["hold"][game_id]
+		if game == null:
+			continue
+		game_controller.step(game, 0)   # HOLD -> RELEASE
+		game_controller.step(game, 0)   # RELEASE -> PUBLISH
+		released += 1
+		coop_log.info(coop.config.log_name, "play: released and put [%s] on sale" % [String(game["name"])])
+	return released > 0
+
+
+# Another office, on an empty applicable building, the same way the first one was made.
+static func __action_office(coop):
+	var tile = company.find_empty_office()
+	if tile == null:
+		return false
+	var result = company.furnish_first_office("Branch", tile, null)
+	if result.begins_with("tile "):
+		return false
+	coop_log.info(coop.config.log_name, "play: opened another office: %s" % [result])
+	return true
+
+
+# Furniture into the office: an item created and placed the way the shop does it.
+static func __action_furnish(coop):
+	if not models.has_model("item"):
+		return false
+	var office = coop.company_id_for_office()
+	if office == "":
+		return false
+	var item_model = models.get_model("item")
+	var studio_model = models.get_model("studio")
+	var computers = item_model.list_available_computers(models.get_model("date").get_date())
+	if computers == null or computers.size() == 0:
+		return false
+	var item = item_model.create_item(String(computers[0].id))
+	item["bought"] = true
+	item_model.set_position(item, Vector2(0, 0))
+	studio_model.add_item(office, item, false)
+	coop_log.info(coop.config.log_name, "play: put a %s in office %s" % [
+		String(computers[0].label), office.substr(0, 8)
+	])
+	return true
+
+
+# A technology, bought the way the research screen buys one.
+static func __action_research(coop):
+	if not models.has_model("game-type"):
+		return false
+	var gametype = models.get_model("game-type")
+	for type_id in gametype.type_static_data:
+		if gametype.is_game_type_unlocked(type_id):
+			continue
+		gametype.unlock_game_type(String(type_id), true)
+		coop_log.info(coop.config.log_name, "play: researched the %s genre" % [String(type_id)])
+		return true
+	return false

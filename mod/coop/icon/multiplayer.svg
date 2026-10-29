@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Two people, the icon for the Multiplayer entry in the main menu.
+
+  This engine build cannot load an SVG at runtime (Godot 2.1 has no SVG support and the build has no
+  rasteriser), so build/build_mod.py draws these same two silhouettes into a 128x128 PNG and wraps it
+  in one of the game's own .tex containers, which is what the menu actually loads
+  (res://coop/icon/multiplayer.tex). This file is the design source: change it and change
+  PERSON_BACK / PERSON_FRONT in build_mod.py to match.
+
+  The geometry below is in the 128x128 space the drawing code uses: a head circle plus a rounded
+  body, twice, the back person smaller and higher.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <g fill="#ffffff">
+    <!-- back person -->
+    <circle cx="84" cy="40" r="13"/>
+    <rect x="68" y="54" width="32" height="34" rx="10" ry="10"/>
+    <!-- front person -->
+    <circle cx="46" cy="52" r="15"/>
+    <rect x="26" y="68" width="40" height="34" rx="10" ry="10"/>
+  </g>
+</svg>

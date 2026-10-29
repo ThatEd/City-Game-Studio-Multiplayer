@@ -1,0 +1,35 @@
+# Private state: the extracted game scripts, the patched pack, probe dumps, evidence, the owner's saves.
+#
+# This lives at the bundle root as well as at the hub root on purpose. If this folder is ever extracted
+# into its own repository, the hub's .gitignore does not come with it, and the contents of local/ must
+# still never be published: they are a decompressed copy of the game.
+local/
+CGS/local/
+
+# Build output. `build/out` is a complete ~400 MB copy of the game with the mod injected.
+build/out/
+build/*.pck
+*.pck
+
+# The relay's kept companies. These are player data, not source.
+coop/store/
+coop/*.log
+coop/remote-*.cmd
+
+# Test and tool leftovers
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.dmp
+run_*.json
+plan_*.json
+pid-*.txt
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
