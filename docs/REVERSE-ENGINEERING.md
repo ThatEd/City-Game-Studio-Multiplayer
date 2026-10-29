@@ -8,13 +8,18 @@ For someone who needs to redo this, or who is wondering why the build has to pat
 |---|---|
 | Title | City Game Studio |
 | Steam app id | `726840` |
-| Version tested | 1.29.0-rc3, Steam build `25723493` |
+| Version tested | **v1.28.1**, Steam build `25723493` |
 | Executable | `CityGameStudio64.exe`, 17,027,584 bytes, PE32+ x64 |
 | Engine | **Godot 2.1.7-stable**, custom build |
 | Content | `data.pck`, 376,378,687 bytes, 6,869 entries |
 
 The engine identifies itself as Godot 2.1.7, which matters for everything below: the script format is
 `.gde` (compiled bytecode), the settings live in `res://engine.cfb`, and the API is Godot **2**'s.
+
+**Version correction, kept visible on purpose.** An earlier pass recorded `1.29.0-rc3`, taken from the
+store page. The build actually installed and tested reports **v1.28.1** in its own menu, and its own fresh
+company data says `"version":"v1.28.1"`. Steam build `25723493` is the identity to match on; a version
+string read off a store page is not the version of the thing that ran.
 
 ## The pack was encrypted, and the key is in the exe
 

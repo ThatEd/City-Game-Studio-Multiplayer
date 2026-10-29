@@ -11,7 +11,7 @@ For someone who wants to actually play, not build. Read the warning first.
 
 - Windows.
 - The game, on Steam: **City Game Studio**, app id `726840`. Tested on Steam build `25723493`,
-  game v1.29.0-rc3.
+  game **v1.28.1**.
 - Python 3 on `PATH` (the relay is a Python script).
 - The same game build on both machines. The world transfer is the host's save; a mismatch is not
   detected, so keep them equal.
