@@ -30,6 +30,7 @@ const HOME_STUDIO_NAME = "Home"
 
 const pngloader_utils = preload("res://scripts/utils/png-loader.gd")
 const coop_log = preload("res://coop/log.gd")
+const saves_lib = preload("res://coop/saves.gd")
 
 # Starting balance for a company made from scratch on a joined world.
 const STARTING_CURRENCY = 100000
@@ -632,7 +633,7 @@ static func owned_studios():
 
 
 # The local player's company as a competitor record, or null when no game is loaded.
-static func record(player_id, slot = null, exclude_games = null):
+static func record(player_id, slot = null, exclude_games = null, session_save_id = ""):
 	if not models.is_loaded():
 		return null
 
@@ -664,6 +665,11 @@ static func record(player_id, slot = null, exclude_games = null):
 		consoles = my_consoles(),
 		games = my_games(exclude_games),
 		genres = my_genres(),
+		# The name of the save this player's own game would write. It travels with the company so the
+		# relay can tell a returning player which save is theirs; the file itself never leaves the
+		# machine that wrote it.
+		save = saves_lib.save_name(String(session_save_id), String(player_id)),
+		session = String(session_save_id),
 		# The conventions this machine knows about. Conventions are half shared and half personal: which
 		# events exist is the world's, what a player did with them is not. Carrying the catalogue here is
 		# what stops one player seeing a convention the other cannot.
@@ -910,6 +916,111 @@ static func catalogue_name(company_id):
 		if entry.has("name"):
 			return String(entry["name"])
 	return String(company_id)
+
+
+# Every company in this world that a joining player could take over.
+#
+# Two sources, because two kinds of company exist:
+#   * the AI rivals, which live in the concurrent model and are in `catalogue`;
+#   * other co-op players' companies, which live in the coop-state section and carry their own name.
+#
+# There is no network round trip here and none is needed: a client only asks this once the host's world
+# has arrived, and by then every company in it is already local. That is deliberate - a listing that
+# came over the wire could disagree with the world it describes.
+#
+# Returns a list of {id, name, offices, currency, fanbase, kind, away}, which is what lobby.gd renders.
+static func takeover_candidates():
+	var out = []
+	if not models.is_loaded() or not models.has_model("concurrent"):
+		return out
+
+	var own_id = ""
+	var own_name = ""
+	if models.has_model("player"):
+		var me = models.get_model("player").get_data()
+		if me != null and me.has("id"):
+			own_id = String(me["id"])
+		if me != null and me.has("company_name"):
+			own_name = String(me["company_name"])
+
+	var concurrent = models.get_model("concurrent")
+	var live = concurrent.get_concurrent()
+	if live != null:
+		for company_id in live:
+			var id = String(company_id)
+			# Never offer this machine's own company as something to take over. The id check is the
+			# reliable one; the name check below covers the case where a previous session wrote this
+			# company's own name onto another rival's record.
+			if id == own_id:
+				continue
+			var entry = live[company_id]
+			if entry == null:
+				continue
+			var entry_name = catalogue_name(id)
+			if entry.has("coop_name"):
+				entry_name = String(entry["coop_name"])
+			# Skip an entry that is this machine's own company wearing another id: a stale write from an
+			# older build could leave the player's own name on a rival record, and offering it would let
+			# a player "take over" themselves.
+			if own_name != "" and entry_name == own_name:
+				continue
+			out.push_back({
+				id = id,
+				name = entry_name,
+				offices = int(concurrent.get_concurrent_studio_amount(id)),
+				currency = int(entry.currency) if entry.has("currency") else 0,
+				fanbase = int(entry.fanbase) if entry.has("fanbase") else 0,
+				kind = "rival",
+				away = false
+			})
+
+	# Companies the world remembers from previous co-op sessions. These are players who are not
+	# connected right now, which is exactly who a new joiner most likely wants to pick up.
+	if models.has_model("coop-state"):
+		var coop_state = models.get_model("coop-state")
+		var remembered = []
+		if coop_state.has_method("ids"):
+			remembered = coop_state.ids()
+		for player_id in remembered:
+			var id = String(player_id)
+			if id == own_id:
+				continue
+			if __has_candidate(out, id):
+				continue
+			var record = null
+			if coop_state.has_method("get_player"):
+				record = coop_state.get_player(player_id)
+			if record == null or typeof(record) != TYPE_DICTIONARY:
+				continue
+			var offices = 0
+			if record.has("studios") and typeof(record["studios"]) == TYPE_ARRAY:
+				offices = record["studios"].size()
+			elif record.has("offices") and typeof(record["offices"]) == TYPE_ARRAY:
+				offices = record["offices"].size()
+			elif record.has("studios") and typeof(record["studios"]) == TYPE_INT:
+				# A count, not a list. Reading .size() off it is a native crash, not an error.
+				offices = int(record["studios"])
+			var away = true
+			if record.has("present"):
+				away = not bool(record["present"])
+			out.push_back({
+				id = id,
+				name = String(record["name"]) if record.has("name") else id,
+				offices = offices,
+				currency = int(record["currency"]) if record.has("currency") else 0,
+				fanbase = int(record["fanbase"]) if record.has("fanbase") else 0,
+				kind = "player",
+				away = away
+			})
+
+	return out
+
+
+static func __has_candidate(entries, id):
+	for entry in entries:
+		if String(entry["id"]) == String(id):
+			return true
+	return false
 
 
 static func __catalogue_data():
@@ -1282,6 +1393,79 @@ static func choose(choice, player_name):
 			note = open_first_studio(name)
 
 	return "took over %s (%s)" % [name, note]
+
+
+# After a takeover, any employee still pointing at a studio that no longer exists is re-seated.
+#
+# The game's own acquisition (`_player_bought_concurrent_confirm`) hands over the rival's offices and
+# their staff, but the offices it creates are new ids - so an employee whose `studio_id` was the old
+# studio is left pointing at a room that no longer exists. Observed as
+# `staff (developers:1), (orphans:[developer/3a74e8d0]), (seated_ok:True)` right after a lobby takeover:
+# the person exists, has a desk nowhere, and their work goes nowhere.
+static func reseat_after_takeover():
+	if not models.is_loaded() or not models.has_model("staff"):
+		return 0
+	var seat = first_player_studio()
+	if seat == "":
+		coop_log.warning("coop", "takeover: no office of ours to seat anyone in")
+		return 0
+	# Only the employees whose room no longer exists are moved. __rebind_staff would skip them: it
+	# compares against the seat, and an orphan's studio_id is a *stale* id, so it looks like a normal
+	# assignment rather than a broken one.
+	var studio_model = models.get_model("studio")
+	var concurrent = models.get_model("concurrent")
+	var staff = models.get_model("staff")
+	var data = staff.get_data()
+	var moved = 0
+	for specialty in data.keys():
+		var group = data[specialty]
+		if group == null or typeof(group) != TYPE_DICTIONARY:
+			continue
+		for employee_id in group:
+			var employee = group[employee_id]
+			if employee == null or typeof(employee) != TYPE_DICTIONARY:
+				continue
+			if not employee.has("studio_id") or employee["studio_id"] == null:
+				continue
+			var current = String(employee["studio_id"])
+			if studio_model.get_studio_by_id(current) != null and not concurrent.is_studio_owned(current):
+				continue
+			employee["studio_id"] = seat
+			# The desk it sat at went with the old room, so its binding is dropped too; __ensure_workstation
+			# below gives it a real one in the office it now belongs to.
+			if employee.has("item_id"):
+				employee["item_id"] = null
+			moved += 1
+	if moved > 0:
+		__ensure_workstation(seat)
+		coop_log.info("coop", "takeover: %s employee(s) moved out of a studio that no longer exists "
+			% [String(moved)] + "into %s" % [seat.substr(0, 8)])
+	return moved
+
+
+# Applies the logo and specialisation a player picked in the lobby's company form.
+#
+# The form is the game's own, so its data has `company_logo` (base64) and `specialization` - the same
+# keys `new-game/main.gd` puts into the player it creates. Nothing is invented here: a value that is
+# absent is left alone rather than replaced with a default.
+static func apply_logo(data):
+	if data == null or typeof(data) != TYPE_DICTIONARY or not models.is_loaded():
+		return false
+	if not models.has_model("player"):
+		return false
+	var player = models.get_model("player")
+	var applied = false
+	if data.has("company_logo") and data["company_logo"] != null and String(data["company_logo"]) != "":
+		var texture = pngloader_utils.base64_to_variant(String(data["company_logo"]))
+		if texture != null:
+			player.set("_company_logo", String(data["company_logo"]))
+			player.set("company_logo_texture", texture)
+			applied = true
+	if data.has("company_name") and String(data["company_name"]) != "":
+		player.set("_company_name", String(data["company_name"]))
+		player.set("_player_name", String(data["company_name"]))
+		applied = true
+	return applied
 
 
 # Sets the player's own company identity (name, prestige, logo) without touching the models that hold

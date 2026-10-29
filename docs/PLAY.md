@@ -65,7 +65,28 @@ cd build\out
 Wait until the host's log says `selftest: ready` **before** the guest starts. A client that starts
 first opens its own New Game and plays alone.
 
-## 3. What you should see
+## 3. The lobby
+
+After the guest presses **Join a game**, they stay in the main menu and a lobby appears:
+
+```
+Join a game
+The host's world is here. Choose the company you want to run.
+[ Start a new company ]
+Or take over an existing company
+[ Fresh Studio  -  player  -  1 office(s)  -  $300,004 ]
+[ Back ]
+```
+
+**Start a new company** opens the game's own setup screen - name, randomise, logo, the logo drawer, genre
+specialisation. Fill it in, press **Create and join**, and the world transfers.
+
+**Take over a company** hands over the one you press, with its money, offices and furniture.
+
+Nothing is transferred until one of those is pressed, so the guest sees this screen while still in the
+menu, never inside a game they did not choose.
+
+## 4. What you should see
 
 1. Both windows land in a game. The host's world is the world; the guest's clock follows the host's.
 2. Each menu bar has a **Multiplayer** button at the end. It opens a panel where money, a technology,
@@ -74,7 +95,7 @@ first opens its own New Game and plays alone.
 4. A guest who leaves and comes back is handed their company — money, offices, and the furniture in
    those offices — back.
 
-## 4. What will annoy you
+## 5. What will annoy you
 
 | | |
 |---|---|
@@ -85,7 +106,7 @@ first opens its own New Game and plays alone.
 | **Ctrl-C on the relay** | Ends the session. The guest sees the disconnect screen and is returned to the menu, which is the intended behaviour |
 | **Release may not publish** | The Release button fires but the project may stay in `HOLD`. Known, unconfirmed |
 
-## 5. If it goes wrong
+## 6. If it goes wrong
 
 Every instance writes its own log to `build\out\coop\`:
 
@@ -110,7 +131,7 @@ To ask a running instance what it thinks:
 .\tools\send.ps1 -Run mygame -Role host -Command "state"
 ```
 
-## 6. Where the mod actually is
+## 7. Where the mod actually is
 
 Nothing is installed into the game. `build\out\` is a copy; delete it and you are back to unmodified
 Steam. The only files the mod adds are inside that copy's `data.pck` and one settings entry in its

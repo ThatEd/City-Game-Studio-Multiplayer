@@ -18,9 +18,9 @@ What that means, split by whether it has actually been seen:
 
 | | |
 |---|---|
-| **Playable** | A host and a client join, boot the same world, and each runs a company. Both appear in each other's rival list by name, with their own money, offices and released games. Time is the host's; a client cannot move it alone. Money, technology and a game's IP can be handed to the other player and both sides agree. When the host leaves, the client is told on screen, saves, and is returned to the main menu. A returning player is handed their company and their office interiors back. |
+| **Playable** | A joining player picks who they are in a **lobby** - either the game's own company setup (name, logo, specialisation) or an existing company to take over - and only then is the world sent. Each player's save is stored per session and per player. A host and a client join, boot the same world, and each runs a company. Both appear in each other's rival list by name, with their own money, offices and released games. Time is the host's; a client cannot move it alone. Money, technology and a game's IP can be handed to the other player and both sides agree. When the host leaves, the client is told on screen, saves, and is returned to the main menu. A returning player is handed their company and their office interiors back. |
 | **Only tested by a machine** | Everything above is asserted by an in-game suite (`--coop-verify`) on both machines and by 12 relay cases. What has *not* been looked at by a human is the publish-offer list, the console panel and the map. Release from the UI is **unconfirmed**: the button fires and spends money, but nobody has watched the project leave `HOLD`. |
-| **Not done** | Split screen. A lobby. Three or more players at once (the protocol is host-plus-N, but only two have ever run). Rejoining mid-session without a fresh world transfer. Steam invite/friends list — joining is a typed address today. |
+| **Not done** | Split screen. Three or more players at once (the protocol is host-plus-N, but only two have ever run). Rejoining mid-session without a fresh world transfer. Steam invite/friends list — joining is a typed address today. |
 
 There is no installer. It runs from a build folder and is launched with flags, which is the actual
 barrier between this and "someone can play it tonight". See
@@ -35,6 +35,27 @@ and it moves messages between them. It is not a server you need a machine for �
 one machine, or one of them runs it.
 
 ---
+
+## The lobby, and how a player chooses
+
+Joining does not drop a player into someone else's studio. The client stays in the main menu and a lobby
+lists what this world offers:
+
+- **Start a new company** opens the game's own company setup - name, randomise, logo, the logo drawer,
+  genre specialisation - and creates it when confirmed.
+- **Take over a company** lists the world's companies (the host's, AI rivals, and players from earlier
+  sessions) and hands over the one picked, through the game's own acquisition path.
+
+The world is **not** transferred until the choice is made. That ordering is the whole design: sending the
+world first means the client has already booted into a game, and there is nothing left to ask. See
+[docs/LOBBY.md](docs/LOBBY.md).
+
+## Saves
+
+A co-op save is named after the session and the player, `user://coop-<session>-<player>.cgs`, so it can
+never overwrite a single-player save or another session's. The file stays on the machine that wrote it;
+what travels is the *name*, on the company record, so the relay can tell a returning player which save is
+theirs. See [docs/SAVES.md](docs/SAVES.md).
 
 ## What it syncs, and what it deliberately does not
 

@@ -73,6 +73,7 @@ def main():
     ok = True
     ok &= run("relay", [PYTHON, "-I", "server/run_tests.py"])
     ok &= run("godot pack tool", [PYTHON, "-I", "tools/godotpck/run_tests.py"])
+    ok &= run("build guards", [PYTHON, "-I", "build/build_run_tests.py"])
     ok &= check_mod_compiles()
     say()
     if ok:

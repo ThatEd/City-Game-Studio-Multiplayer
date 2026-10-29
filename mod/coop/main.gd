@@ -26,6 +26,8 @@ const link_lib = preload("res://coop/link.gd")
 const company = preload("res://coop/company.gd")
 const trade = preload("res://coop/trade.gd")
 const menu_lib = preload("res://coop/menu.gd")
+const lobby_lib = preload("res://coop/lobby.gd")
+const saves_lib = preload("res://coop/saves.gd")
 const ui_lib = preload("res://coop/ui.gd")
 const play_lib = preload("res://coop/play.gd")
 const pilot_lib = preload("res://coop/pilot.gd")
@@ -161,7 +163,13 @@ var __logo_sent = false
 
 func __local_id():
 	if __player_id == "":
-		__player_id = company.make_id(config.name)
+		var name = String(config.name)
+		if name == "" or name == "player":
+			# Before a game exists there is nothing on the player model to take an id from, so the id
+			# comes from the session name. Reported once, because an empty id here silently produced a
+			# save called `coop--` and a lobby that could not name the player's own save.
+			coop_log.info(config.log_name, "net: this player is unnamed, using [%s]" % [name])
+		__player_id = company.make_id(name)
 	return __player_id
 var __world_received = false
 var __own_company_ready = false
@@ -185,6 +193,21 @@ var __time_request_at = {}
 var __company_table_seen = false
 var __join_ready_at = 0.0
 var __pick_company_pending = false
+# How long the lobby waits for a choice before the join proceeds on its own. Generous: a player reading
+# a list is not a stalled program.
+const LOBBY_PICK_SECONDS = 180.0
+var __lobby_pick_deadline = 0.0
+var __lobby_missing_reported = false
+var __lobby_announced = false
+var __lobby_summary_seen = false
+var __lobby_entries = []
+# What the player typed into the company form, applied to the new company after the world arrives.
+var __lobby_new_company = {}
+# The name of the save this world is, which every player's own save is named after.
+var __world_save_id = ""
+# When to clear up after a takeover. See the call site in __finish_join.
+var __takeover_reseat_at = -1.0
+var __takeover_reseat_done = false
 var __last_other_count = -1
 
 
@@ -224,9 +247,9 @@ const COMPILE_PROBE_IN_USE = 22
 
 func __probe_helpers():
 	var paths = ["res://coop/remote.gd", "res://coop/pilot.gd", "res://coop/play.gd", "res://coop/ui.gd",
-		"res://coop/menu.gd", "res://coop/company.gd", "res://coop/state.gd", "res://coop/trade.gd",
-		"res://coop/link.gd", "res://coop/log.gd", "res://coop/dict.gd", "res://coop/args.gd",
-		"res://coop/automation.gd", "res://coop/updater.gd"]
+		"res://coop/menu.gd", "res://coop/lobby.gd", "res://coop/company.gd", "res://coop/state.gd",
+		"res://coop/trade.gd", "res://coop/link.gd", "res://coop/log.gd", "res://coop/dict.gd",
+		"res://coop/args.gd", "res://coop/automation.gd", "res://coop/updater.gd"]
 	for path in paths:
 		var script = load(String(path))
 		if script == null:
@@ -370,7 +393,7 @@ func __leave_session_to_menu():
 func __hand_over_own_company():
 	if __link == null or not __link.is_live():
 		return
-	var record = company.record(__local_id())
+	var record = company.record(__local_id(), null, null, __world_save_id)
 	if record == null:
 		coop_log.warning(config.log_name, "net: no company to hand over")
 		return
@@ -388,9 +411,100 @@ func __save_own_company():
 	if save_manager.is_saving():
 		return "a save was already in progress, company not written"
 	var started = OS.get_ticks_msec()
+	# A co-op save is named after the session and the player, so it can never overwrite a single-player
+	# save or another session's. See mod/coop/saves.gd.
+	#
+	# It goes through `_save_game_as(name)` rather than `save_game()`: the latter derives the filename
+	# from `data.player.id` inside its worker thread, and `player.get_data()` hands back a fresh
+	# dictionary each call, so writing to it changed nothing and the save landed under the host's id.
+	# `_save_game_as` is the game's own "Save As" path and takes the name as an argument - which is
+	# exactly what is needed here, and is the same path the in-game Save As button uses.
+	var name = __coop_save_name()
+	if name == "":
+		if save_manager.save_game():
+			return "company written in %s ms (no co-op name, used the game's own)" % [
+				String(OS.get_ticks_msec() - started)
+			]
+		return "the save manager refused the write"
+	if save_manager.has_method("_save_game_as") and save_manager.call("_save_game_as", name):
+		# The write is on a worker thread; wait for it so the file exists before anything reads it.
+		var waited = 0
+		while save_manager.is_saving() and waited < 5000:
+			waited += 10
+			OS.delay_msec(10)
+		return "company written in %s ms as %s" % [String(OS.get_ticks_msec() - started), name]
 	if save_manager.save_game():
-		return "company written in %s ms" % [String(OS.get_ticks_msec() - started)]
+		return "company written in %s ms (save-as unavailable, used the game's own name)" % [
+			String(OS.get_ticks_msec() - started)
+		]
 	return "the save manager refused the write"
+
+
+# Whether a co-op save with this name is already on this machine.
+func is_coop_save_present(name):
+	if name == "":
+		return false
+	var file = File.new()
+	return file.file_exists("user://%s.cgs" % [name])
+
+
+# The name of the save this world is.
+#
+# For the host that is whatever save the game loaded, which the game remembers as `lastsavegame`. The mod
+# reads it rather than deriving one, so the name a client's save is built from is the real name of the
+# world they joined - and a player returning to the same host save finds their own save again.
+#
+# A *co-op* name is never adopted as the world's: `lastsavegame` is shared by every instance on a machine,
+# so a host started after a client session would otherwise take the client's save name as its own - which
+# it did, and reported itself under the client's company name.
+func __learn_world_save_id():
+	if config.role != "host":
+		return __world_save_id
+	var name = ""
+	if save_manager != null and save_manager.has_method("get_last_savegame"):
+		var last = save_manager.call("get_last_savegame")
+		if last != null:
+			name = String(last)
+	if name.begins_with("user://"):
+		name = name.substr(7, name.length())
+	if name.ends_with(".cgs"):
+		name = name.substr(0, name.length() - 4)
+	# A co-op save name is another session's, not this world's. `lastsavegame` is shared by every instance
+	# on a machine, so a host started after a client session otherwise adopts the client's save name as
+	# its own - which it did, and then reported itself under the client's company name.
+	if saves_lib.is_coop_save(name):
+		coop_log.info(config.log_name, "save: ignoring [%s], it is another session's co-op save" % [name])
+		name = ""
+	if name == "":
+		# A world started from New Game has no save name yet. It gets one from the session, so clients
+		# still have a stable per-session name to build their own saves from.
+		name = saves_lib.session_name_from(config.name)
+		coop_log.info(config.log_name, "save: this world has no save yet, calling the session [%s]" % [
+			name
+		])
+	__world_save_id = name
+	if name != "":
+		coop_log.info(config.log_name, "save: this world is [%s]" % [name])
+	return name
+
+
+# Launches the host world with a save name it did not have before.
+func __tick_world_save_id():
+	if __world_save_id != "":
+		return
+	if not models.is_loaded():
+		return
+	__learn_world_save_id()
+
+
+# The name this player's save should have in this session, or "" when a co-op name does not apply.
+func __coop_save_name():
+	if config.role == "off":
+		return ""
+	var session = ""
+	if models.is_loaded() and models.has_model("coop-state"):
+		session = String(__world_save_id)
+	return saves_lib.save_name(session, __local_id())
 
 
 # The screen the player sees when the host is gone.
@@ -535,8 +649,10 @@ func __poll_network():
 		coop_log.info(config.log_name, "net: registered as %s (%s)" % [config.role, company_name])
 
 		if config.role == "client":
-			__link.send({"t": "join_request", "player": player_id})
-			coop_log.info(config.log_name, "net: asked the host for the world")
+			__link.send({"t": "join_request", "player": player_id, "auto": __lobby_bypassed()})
+			coop_log.info(config.log_name, "net: asked the host to join%s" % [
+				" (no lobby: auto)" if __lobby_bypassed() else ", lobby first"
+			])
 
 	if __elapsed >= __next_debug_at:
 		__next_debug_at = __elapsed + 1.0
@@ -770,7 +886,7 @@ func __save_remote_player(player_id, record):
 # The host's own record plus every client record it has been told about.
 func __host_publish_companies():
 	var table = []
-	var own = company.record(__local_id(), null, __rival_game_ids)
+	var own = company.record(__local_id(), null, __rival_game_ids, __world_save_id)
 	if own != null:
 		table.push_back(own)
 	for player_id in __client_companies:
@@ -778,6 +894,16 @@ func __host_publish_companies():
 
 	__link.send({"t": "companies", "companies": table})
 	__apply_company_table(table)
+	# Named, because a wrong id here silently renames this machine's own company to another player's.
+	var table_ids = []
+	for record in table:
+		table_ids.push_back("%s=%s" % [
+			dict_lib.text(record, "id", "?"), dict_lib.text(record, "name", "?")
+		])
+	coop_log.info(config.log_name, "net: publishing companies %s (mine is %s=%s)" % [
+		desc(table_ids), __local_id(),
+		String(models.get_model("player").get_data().company_name)
+	])
 	# The world's company section is part of the save, so a player who leaves is still in the world
 	# next time it is loaded, with their offices and games intact.
 	company.save_into_world(__local_id(), true)
@@ -812,7 +938,7 @@ func __poll_client_network():
 
 	if __elapsed >= __next_company_at:
 		__next_company_at = __elapsed + COMPANY_INTERVAL
-		var record = company.record(__local_id(), null, __rival_game_ids)
+		var record = company.record(__local_id(), null, __rival_game_ids, __world_save_id)
 		if record != null:
 			__link.send({"t": "company", "company": record})
 			var change = company.change(__last_company, record)
@@ -880,13 +1006,39 @@ func __handle_server_message(message):
 		__on_world(__world_models)
 
 	elif message["t"] == "join_request":
-		# A player is joining: stop time until they are in, so the world cannot move under them.
+		# A player is joining. They are *not* sent the world: they are shown a lobby first, and the
+		# lobby only needs a summary of who is here. Sending the whole world before they had chosen who
+		# they were was exactly why the lobby could not exist - the client had already booted into a
+		# game, so there was nothing left to ask.
 		var joiner = dict_lib.text(message, "player", "")
 		__joining[joiner] = true
-		coop_log.info(config.log_name, "net: %s is joining, pausing" % [dict_lib.text(message, "name", "?")])
+		coop_log.info(config.log_name, "net: %s wants in, offering the lobby" % [
+			dict_lib.text(message, "name", "?")
+		])
+		__send_lobby_summary(joiner)
+		# An automated client has nobody to press the lobby, so it says so on its own behalf and the
+		# world follows immediately.
+		if bool(dict_lib.field(message, "auto", false)):
+			coop_log.info(config.log_name, "net: %s joins without a lobby (auto)" % [joiner])
+			__pause(true)
+			__broadcast_clock()
+			__maybe_send_logo(true)
+			__send_world()
+
+	elif message["t"] == "session_request":
+		__send_lobby_summary(dict_lib.text(message, "player", ""))
+
+	elif message["t"] == "lobby_pick":
+		# The player has decided who they will be. Only now is the world sent.
+		var picker = dict_lib.text(message, "player", "")
+		coop_log.info(config.log_name, "net: %s chose [%s], sending the world" % [
+			picker, dict_lib.text(message, "choice", "new")
+		])
+		var record = dict_lib.field(message, "company", null)
+		if record != null:
+			__client_companies[picker] = record
 		__pause(true)
 		__broadcast_clock()
-		# A new joiner has no logo yet, so the host's own is re-sent with the world.
 		__maybe_send_logo(true)
 		__send_world()
 
@@ -1043,11 +1195,74 @@ func __handle_server_message(message):
 						])
 			__host_publish_companies()
 
+	elif message["t"] == "session_summary":
+		__on_lobby_summary(message)
+
 	elif message["t"] == "error":
 		coop_log.error(config.log_name, "net: server says " + dict_lib.text(message, "message", "?"))
 
 	else:
 		coop_log.info(config.log_name, "net: unhandled message %s" % [String(message["t"])])
+
+
+# The lobby's data arrived. This is the point the client can show its choices - and only now, because
+# before the summary it knows nothing about the host's world at all.
+func __on_lobby_summary(message):
+	if config.role != "client":
+		return
+	if not bool(dict_lib.field(message, "ready", false)):
+		var why = dict_lib.text(message, "reason", "not ready")
+		coop_log.warning(config.log_name, "lobby: the host is not ready yet (%s)" % [why])
+		var panel = __ensure_lobby()
+		lobby_lib.show_message(panel, "Waiting for the host: " + why)
+		return
+	var entries = dict_lib.field(message, "companies", [])
+	__lobby_entries = entries
+	__lobby_summary_seen = true
+	# The session's save name, so this player's own save can be named after it.
+	var session = dict_lib.text(message, "session", "")
+	if session != "":
+		__world_save_id = session
+		var my_id = __local_id()
+		var mine = saves_lib.save_name(session, my_id)
+		coop_log.info(config.log_name, "lobby: this world is save [%s], my id [%s], my save [%s]" % [
+			session, my_id, mine
+		])
+	__show_lobby_choices()
+
+
+# The information a joining player needs to choose who they are, without the world.
+#
+# The world is megabytes and takes seconds; a lobby must be instant. The host therefore answers with a
+# summary: the date, and every company in it - the host's own, the AI rivals worth taking over, and the
+# co-op companies from earlier sessions. That is exactly what `company.takeover_candidates()` reads, so
+# the host builds it from its own live models and sends only the list.
+func __send_lobby_summary(player_id):
+	if not models.is_loaded():
+		coop_log.warning(config.log_name, "net: asked for a lobby summary before a game is loaded")
+		__link.send({"t": "session_summary", "for": player_id, "ready": false,
+			"reason": "the host has not loaded a game yet"})
+		return
+
+	var date = models.get_model("date").get_date()
+	var entries = company.takeover_candidates()
+	var mine = company.record(__local_id(), null, __rival_game_ids, __world_save_id)
+	__link.send({
+		"t": "session_summary",
+		"for": player_id,
+		"ready": true,
+		"year": int(date.year),
+		"month": int(date.month),
+		"week": int(date.week),
+		"host_name": String(mine["name"]) if mine != null and mine.has("name") else "",
+		# The name of the save this world *is*, so each player's own save can be named after it and a
+		# returning player can be told which save is theirs. The file never travels; the name does.
+		"session": String(__world_save_id),
+		"companies": entries
+	})
+	coop_log.info(config.log_name, "net: lobby summary for %s (%s company/companies, %s/%s)" % [
+		String(player_id), String(entries.size()), String(date.year), String(date.month)
+	])
 
 
 # Time is shared, not owned. Any player may press pause or a speed, but the world answers first:
@@ -1711,7 +1926,182 @@ func menu_join_pressed():
 	__network_wanted = true
 	menu_lib.set_options_visible(menu, false)
 	coop_log.info(config.log_name, "menu: joining %s:%s" % [config.host, String(config.port)])
+	# The lobby appears straight away in its waiting state: the world has not arrived, so the list of
+	# companies to take over does not exist yet. Showing it now, rather than after the transfer, is what
+	# tells the player something is happening at all.
+	__show_lobby_waiting("%s:%s" % [config.host, String(config.port)])
 	__start_network()
+
+
+# --- the lobby -----------------------------------------------------------
+#
+# Choosing *who you are* in the host's world, which the two menu buttons used to skip entirely.
+# See mod/coop/lobby.gd for why it is a panel and not a scene.
+
+func __show_lobby_waiting(address):
+	var panel = __ensure_lobby()
+	lobby_lib.show_waiting(panel, address)
+	coop_log.info(config.log_name, "lobby: waiting for the host's world (%s)" % [String(address)])
+
+
+# Called once the world is in and this machine knows which companies exist.
+func __show_lobby_choices():
+	if config.role != "client":
+		return
+	var panel = __ensure_lobby()
+	var entries = __lobby_entries
+	if entries == null or entries.size() == 0:
+		entries = company.takeover_candidates()
+	lobby_lib.show_choices(panel, self, entries)
+	if not __lobby_announced:
+		__lobby_announced = true
+		coop_log.info(config.log_name, "lobby: %s company/companies to take over, plus a new one" % [
+			String(entries.size())
+		])
+		for entry in entries:
+			coop_log.info(config.log_name, "lobby:   [%s] %s  %s office(s)  $%s  (%s)" % [
+				String(lobby_lib.value_of(entry, "id", "")),
+				String(lobby_lib.value_of(entry, "name", "")),
+				String(int(lobby_lib.value_of(entry, "offices", 0))),
+				String(int(lobby_lib.value_of(entry, "currency", 0))),
+				String(lobby_lib.value_of(entry, "kind", ""))
+			])
+
+
+# "Start a new company" opens the game's own company form rather than deciding silently. The player
+# names their company, picks a logo and a specialisation there, and only then is anything sent.
+func lobby_new_pressed():
+	lobby_lib.show_create(__lobby_panel())
+	coop_log.info(config.log_name, "lobby: showing the company setup screen")
+
+
+# Reads the game's own form and joins with what the player typed.
+func lobby_create_confirmed():
+	var panel = __lobby_panel()
+	var name = lobby_lib.company_name_text(panel)
+	if name.strip_edges() == "":
+		lobby_lib.show_message(panel, "Your company needs a name before you can join.")
+		return
+	var data = lobby_lib.company_form_data(panel)
+	config.company_choice = "new"
+	config.company_name = name
+	__lobby_new_company = data
+	coop_log.info(config.log_name, "lobby: new company called [%s] (%s field(s))" % [
+		name, String(data.size())
+	])
+	__lobby_commit("a new company called " + name)
+
+
+func lobby_create_back():
+	lobby_lib.show_choose_page(__lobby_panel())
+	lobby_lib.show_choices(__lobby_panel(), self, __lobby_entries)
+
+
+# Receives the company id as a bound argument from the row's `pressed` signal.
+func lobby_takeover_pressed(company_id):
+	config.company_choice = String(company_id)
+	__lobby_commit("company %s" % [config.company_choice])
+
+
+func lobby_cancel_pressed():
+	lobby_lib.hide(__lobby_panel())
+	config.role = "off"
+	__network_wanted = false
+	if __link != null:
+		__link.close()
+		__link = null
+	coop_log.info(config.log_name, "lobby: cancelled, back to single player")
+
+
+func __lobby_commit(label):
+	lobby_lib.show_starting(__lobby_panel(), label)
+	coop_log.info(config.log_name, "lobby: chose %s" % [label])
+	# The world is not here yet - the lobby was shown from a summary, deliberately, so the player never
+	# entered a game they had not chosen. Asking for it now is what starts the transfer.
+	if not __world_received:
+		__link.send({"t": "lobby_pick", "player": __local_id(), "choice": config.company_choice})
+		coop_log.info(config.log_name, "lobby: asked the host for the world")
+		return
+	# A rejoin where the world was already in: finish now.
+	if __pick_company_pending and models.is_loaded():
+		__finish_join()
+
+
+# The lobby panel, if there is one.
+#
+# Attached to the scene root, not to the main menu. The world transfer pushes the game's loading scene,
+# which replaces the menu - so a lobby parented to the menu would be freed at exactly the moment it
+# became useful. The root outlives every scene change.
+# The lobby panel, if there is one.
+#
+# Attached to the scene root, not to the main menu. The world transfer pushes the game's loading scene,
+# which replaces the menu - so a lobby parented to the menu would be freed at exactly the moment it
+# became useful. The root outlives every scene change.
+func __lobby_panel():
+	var root = get_tree().get_root()
+	return root.find_node(lobby_lib.PANEL_NODE, true, false)
+
+
+func __ensure_lobby():
+	var panel = __lobby_panel()
+	if panel != null:
+		return panel
+	panel = lobby_lib.build(self)
+	panel.set_name(lobby_lib.PANEL_NODE)
+	get_tree().get_root().add_child(panel)
+	return panel
+
+
+
+
+
+# Keeps the lobby above the game scene while it is on screen.
+#
+# The game adds its own scene to the root after the mod's, so a root-level panel that was visible and
+# correctly sized was completely covered by the game - the run's screenshot showed the studio, not the
+# lobby, while the lobby's own rect said (202, 40, 722, 460). Raising it once at show time is not enough
+# because the scene it must stay above can be pushed afterwards.
+func __keep_lobby_on_top():
+	if not __lobby_pick_pending():
+		return
+	var panel = __lobby_panel()
+	if panel != null and panel.is_visible():
+		lobby_lib.__raise(panel)
+
+
+# Runs the deferred takeover cleanup, once the game's own acquisition has finished making its offices.
+func __tick_takeover_reseat():
+	if __takeover_reseat_done or __takeover_reseat_at < 0.0:
+		return
+	if __elapsed < __takeover_reseat_at:
+		return
+	__takeover_reseat_done = true
+	company.reseat_after_takeover()
+
+
+# Whether this run skips the lobby.
+#
+# A player sees the lobby. A script cannot press it, so an automated run decides up front - either
+# `--coop-company=<id>` (already decided) or `--coop-pilot` (a script is driving) or
+# `--coop-lobby=off`.
+func __lobby_bypassed():
+	if config.role != "client":
+		return false
+	if config.pilot > 0.0:
+		return true
+	if config.company_choice != "":
+		return true
+	if not config.lobby:
+		return true
+	return false
+
+
+func __lobby_pick_pending():
+	return __pick_company_pending and config.role == "client"
+
+
+func __hide_lobby():
+	lobby_lib.hide(__lobby_panel())
 
 
 # The address box takes "host" or "host:port". A wrong port is not fatal here: the connection simply
@@ -2700,10 +3090,18 @@ func __enforce_host_clock():
 		# fresh host registered with the other player as "" - a nameless rival in their rival list. The
 		# name the session was started with is the one thing the player's identity already carries, and it
 		# is what a client uses for itself, so the host takes the same one.
-		if not __host_named and models.has_model("player") \
-				and String(models.get_model("player").get_data().company_name) == "":
-			coop_log.info(config.log_name, "net: " + company.name_self(config.name))
-			__host_named = true
+		# The host's own name.
+		#
+		# A game started from the New Game dialogue takes whatever name the *game's shared settings* last
+		# remembered, and those settings are per-machine, not per-instance: a host started after a client
+		# session came up carrying the client's company name, and published itself under it. So the
+		# session name wins whenever it was given explicitly, which it is on every launch.
+		if not __host_named and models.has_model("player"):
+			var current = String(models.get_model("player").get_data().company_name)
+			if current == "" or config.name != "":
+				coop_log.info(config.log_name, "net: " + company.name_self(config.name) +
+					" (was [%s])" % [current])
+				__host_named = true
 		__watch_pause()
 		return
 	if config.role != "client" or __host_raw < 0 or not models.is_loaded():
@@ -3147,6 +3545,7 @@ func __on_world(encoded):
 	scene_manager.push_scene(instance, scene_manager.VISIBILITY_STATE.FORCE_HIDE, true, true, true)
 	__pick_company_pending = true
 	__join_ready_at = __elapsed + 15.0
+	__lobby_pick_deadline = __elapsed + LOBBY_PICK_SECONDS
 
 
 # Client: once the world is loaded, become the chosen company and stop running our own clock.
@@ -3160,8 +3559,8 @@ func __finish_join():
 		if not __company_table_seen and __elapsed < __join_ready_at:
 			return
 
+	__hide_lobby()
 	__pick_company_pending = false
-
 	__step("join: choosing company")
 	var result = "kept the fresh company from the mod"
 	var wanted = config.company_choice
@@ -3181,9 +3580,21 @@ func __finish_join():
 		# capture), so only the identity and the office are missing. A studio id is a map tile id, so
 		# the office is opened in this world and the furniture moves with it.
 		result = company.name_self(config.name) + ", " + company.open_first_studio(config.name, __dialog_studio)
+	# A name typed in the lobby's company form wins over the session name: it is the one the player
+	# chose, and it is what their rival will see.
+	if config.company_name != "":
+		result = company.name_self(config.company_name) + " (" + result + ")"
+		company.apply_logo(__lobby_new_company)
 	coop_log.info(config.log_name, "net: company choice %s -> %s" % [
 		wanted, result
 	])
+	# A takeover can leave employees pointing at studios the acquisition replaced.
+	#
+	# Deferred rather than done inline: the game's own buyout creates the taken-over offices as part of
+	# the call, and immediately afterwards the studio model has not caught up - a check at that instant
+	# reported "no office of ours to seat anyone in" and every employee stayed an orphan.
+	if wanted != "" and wanted != "new":
+		__takeover_reseat_at = __elapsed + 2.0
 
 	# The client runs its own company, so its clock must run too - but at the host's speed and
 	# following the host's date, which __apply_clock keeps aligned.
@@ -3486,6 +3897,12 @@ func __can_join():
 	if config.role != "client":
 		return models.is_loaded()
 
+	# A lobby client connects from the main menu, before any game exists. That is the whole point of
+	# the lobby: it is where the player chooses, so waiting for a loaded game would be waiting for the
+	# decision the lobby is meant to ask for.
+	if not __lobby_bypassed():
+		return true
+
 	if config.company_choice != "" and config.company_choice != "new":
 		return true
 
@@ -3685,6 +4102,8 @@ func _process(delta):
 		if __can_join():
 			__start_network()
 	__trace("net-start")
+	__tick_world_save_id()
+	__tick_takeover_reseat()
 	__install_buyout_guard()
 	__trace("buyout")
 	__enforce_host_clock()

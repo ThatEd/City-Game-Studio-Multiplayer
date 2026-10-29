@@ -24,6 +24,8 @@ than being quietly edited out, because the next person will otherwise repeat the
 | Page | What it covers |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Host/client roles, the relay, the world-vs-company split, message types |
+| [LOBBY.md](LOBBY.md) | The join lobby: why it comes before the game, the company list, the game own create form |
+| [SAVES.md](SAVES.md) | Per-session, per-player saves; how the name is chosen, and what the relay keeps |
 | [SYNC.md](SYNC.md) | What is synced, model by model, and why the split is where it is |
 | [DISCONNECT.md](DISCONNECT.md) | What happens when the host dies: the screen, the save, the store, the returning player |
 | [FAIL-POINTS.md](FAIL-POINTS.md) | Every subsystem that could still break, with evidence labels |

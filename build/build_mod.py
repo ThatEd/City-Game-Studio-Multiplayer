@@ -328,6 +328,133 @@ def check_missing_classes(files):
                     f"{name}:{number}: {match.group(1)} does not exist in this build, so naming it is a "
                     "compile error that disables the rest of the file"
                 )
+    problems.extend(_check_missing_operators(files))
+    problems.extend(_check_missing_methods(files))
+    problems.extend(_check_structure(files))
+    return problems
+
+
+def _check_structure(files):
+    """Functions with no body, and functions defined twice.
+
+    Both are parse errors the engine rejects at load, and both were produced by editing: a partial
+    replace left `func __lobby_panel():` twice - once complete, once truncated to its signature - and
+    the whole of main.gd stopped loading. The mod booted as nothing at all: no log, the retail menu with
+    no Multiplayer button, and no error anywhere except one line from the error handler. Two instance
+    launches and a rebuild were spent finding it.
+    """
+    problems = []
+    for name, data in sorted(files.items()):
+        if not name.endswith(".gd"):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        lines = text.splitlines()
+        seen = {}
+        for index, line in enumerate(lines):
+            match = re.match(r"^func (\w+)\s*\(", line)
+            if not match:
+                continue
+            func = match.group(1)
+            if func in seen:
+                problems.append(
+                    f"{name}:{index + 1}: {func}() is already defined at line {seen[func]}; a "
+                    "duplicate definition is a parse error that stops the whole file loading"
+                )
+            else:
+                seen[func] = index + 1
+            # A signature with no indented line after it (allowing comments) has no body.
+            has_body = False
+            for follower in lines[index + 1:]:
+                if not follower.strip() or follower.strip().startswith("#"):
+                    continue
+                has_body = follower.startswith(("\t", " "))
+                break
+            if not has_body:
+                problems.append(
+                    f"{name}:{index + 1}: {func}() has no body; a bare signature is a parse error "
+                    "and stops the whole file loading"
+                )
+    return problems
+
+
+# Language constructs that parse in modern GDScript and are *parse errors* here.
+#
+# Found the hard way: `if child is Button:` took out all of lobby.gd with
+# "Parse Error: ':' expected at end of line", and the only reason it was visible at all is that the
+# mod compiles every script at boot. The game's own scripts never use `is`, which was the clue.
+_BAD_CONSTRUCTS = (
+    (re.compile(r"(?<![\w.])if\s+[^:#]*\bis\s+[A-Z]"), "`is` is not an operator in this engine build",
+     "Recognise a node by has_method() instead."),
+    (re.compile(r"\bawait\b"), "`await` does not exist in Godot 2",
+     "Use yield() or a signal callback."),
+    (re.compile(r"\bclass_name\b"), "`class_name` does not exist in Godot 2",
+     "preload() the script and call its statics."),
+    (re.compile(r"\bfunc\s+\w+\([^)]*\)\s*->"), "return-type annotations do not exist in Godot 2",
+     "Leave the type off."),
+    (re.compile(r"\bvar\s+\w+\s*:[^=]*="), "typed variable declarations do not exist in Godot 2",
+     "Leave the type off."),
+    (re.compile(r"\bexport\s*\("), "`export(...)` syntax does not exist in Godot 2",
+     "This mod builds its nodes in code."),
+    (re.compile(r"\bsignal\s+\w+\("), "signal declarations with parentheses do not exist in Godot 2",
+     "This mod connects to the game's own signals."),
+)
+
+
+def _check_missing_operators(files):
+    problems = []
+    for name, data in sorted(files.items()):
+        if not name.endswith(".gd"):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if not code.strip():
+                continue
+            for pattern, what, fix in _BAD_CONSTRUCTS:
+                if pattern.search(code):
+                    problems.append(f"{name}:{number}: {what}; this build fails to parse it. {fix}")
+    return problems
+
+
+# Engine methods this build does not have. Calling one is either `Invalid call` at runtime or, for the
+# Variant half, a native crash - so neither is catchable where it happens.
+_MISSING_METHODS = (
+    # The leading dot is optional: get_node_or_null() is usually called bare on self, and
+    # can_instance() is called on a script.
+    (re.compile(r"(?<![\w])get_node_or_null\s*\("), "get_node_or_null"),
+    (re.compile(r"\.?can_instance\s*\("), "can_instance"),
+    (re.compile(r"\.sort_custom\s*\("), "sort_custom"),
+    (re.compile(r"\"\.join\s*\("), "String.join"),
+)
+
+
+def _check_missing_methods(files):
+    problems = []
+    for name, data in sorted(files.items()):
+        if not name.endswith(".gd"):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if not code.strip():
+                continue
+            for pattern, method in _MISSING_METHODS:
+                if method is None:
+                    continue
+                if pattern.search(code):
+                    problems.append(
+                        f"{name}:{number}: {method}() does not exist in this build; calling it is a "
+                        "runtime error or a crash, not something that can be caught"
+                    )
     return problems
 
 

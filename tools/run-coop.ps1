@@ -17,7 +17,11 @@ param(
     [int]$Seconds = 900,
     [string]$Stores = "coop\store",
     [switch]$NoClient,
-    [switch]$MapLarge
+    [switch]$MapLarge,
+    # -Lobby starts the client *without* deciding its company, so the lobby appears and a human (or
+    # send.ps1) can press a row. -Company pre-decides, which is what an unattended run wants.
+    [switch]$Lobby,
+    [string]$Company = "new"
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,9 +50,13 @@ if ($MapLarge) { $shared += "--coop-map=4" }
 # booted a local game at the same second the host did.
 $hostArgs = @("--coop-host", "--coop-name=$HostName", "--coop-log=$Name-host", "--coop-selftest") + $shared
 $clientArgs = @(
-    "--coop-join=127.0.0.1", "--coop-autojoin", "--coop-company=new",
+    "--coop-join=127.0.0.1", "--coop-autojoin",
     "--coop-name=$ClientName", "--coop-log=$Name-client"
 ) + $shared
+if (-not $Lobby) {
+    # An unattended run has nobody to press the lobby, so it is told its own answer up front.
+    $clientArgs += "--coop-company=$Company"
+}
 
 # The relay first: a client that starts before it retries, but a host that starts before it cannot
 # register, and a run with no host looks exactly like a broken client.

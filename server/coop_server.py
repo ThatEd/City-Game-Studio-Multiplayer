@@ -63,7 +63,7 @@ class CompanyStore:
 
     KEPT = (
         "id", "name", "note", "fanbase", "currency", "studios", "offices", "layouts",
-        "consoles", "games", "genres", "conventions",
+        "consoles", "games", "genres", "conventions", "save", "session",
     )
 
     def __init__(self, directory=None):

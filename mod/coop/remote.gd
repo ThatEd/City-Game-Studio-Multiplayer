@@ -192,8 +192,10 @@ static func __run(coop, command):
 		return __date(coop, arg1, rest.strip_edges())
 	if verb == "own":
 		return __own(coop)
+	if verb == "lobby":
+		return __lobby(coop, arg1, rest.strip_edges())
 	return "unknown command [%s]; try tree, find, findall, press, fill, call, menu, menuitem, dialogs, " \
-		% [verb] + "close, steam, innodes, paths, presspath, clickpath, grep, date, state"
+		% [verb] + "close, steam, innodes, paths, presspath, clickpath, grep, date, lobby, state"
 
 
 # The clock, through the same controller the calendar's own buttons call. "date pause" and "date run" are
@@ -718,6 +720,111 @@ static func __popup_of(button):
 # Everything the game treats as per-company progression, read from the models that hold it. These are the
 # halves of the world that are NOT one shared world: two players must have their own. Reported here so
 # the same question can be asked of both machines and the answers compared.
+# The join lobby, driven and inspected here rather than by node name: its rows are created at runtime
+# from the host's world, so there is no fixed name to press.
+#
+#   lobby                    what is on screen, and every row
+#   lobby new                press "Start a new company"
+#   lobby take <index>       press row <index>
+static func __lobby(coop, what, arg):
+	var panel = coop.__lobby_panel()
+	if panel == null:
+		return "no lobby on screen"
+	var lines = []
+	var status = ""
+	var status_node = __child_named(panel, "status")
+	if status_node != null and status_node.has_method("get_text"):
+		status = String(status_node.get_text())
+	lines.push_back("visible=%s status=[%s]" % [String(panel.is_visible()), status])
+
+	var list = __child_named(panel, "list")
+	if list != null:
+		var index = 0
+		for child in list.get_children():
+			if child != null and child.has_method("get_text"):
+				lines.push_back("  [%s] %s" % [String(index), String(child.get_text())])
+				index += 1
+		lines.push_back("  %s row(s)" % [String(index)])
+
+	if String(what) == "new":
+		var button = __child_named(panel, "lobby_new")
+		if button == null:
+			return "no [Start a new company] button in the lobby"
+		button.emit_signal("pressed")
+		lines.push_back("pressed [Start a new company]")
+	elif String(what) == "name":
+		# Types into the game's company form. The form is the game's own node tree, so the field is found
+		# through it rather than through the popup the generic `fill` command searches.
+		var field = __find_line_edit(panel)
+		if field == null:
+			var form = panel.find_node("company_form", true, false)
+			if form == null:
+				return "the company form is not open; press [Start a new company] first"
+			return "the company form has no name field"
+		field.set_text(String(arg))
+		# The form saves on a debounce; the signal is what it listens for.
+		field.emit_signal("text_changed", String(arg))
+		lines.push_back("name set to [%s]" % [String(arg)])
+	elif String(what) == "create":
+		var ok = __child_named(panel, "create_ok")
+		if ok == null:
+			return "the company form is not open"
+		ok.emit_signal("pressed")
+		lines.push_back("pressed [Create and join]")
+	elif String(what) == "take":
+		if not String(arg).is_valid_integer():
+			return "lobby take needs a row index, got [%s]" % [String(arg)]
+		var wanted = int(arg)
+		var at = 0
+		var pressed = false
+		for child in list.get_children():
+			if child == null or not child.has_method("get_text"):
+				continue
+			if at == wanted:
+				child.emit_signal("pressed")
+				lines.push_back("pressed row [%s] %s" % [String(at), String(child.get_text())])
+				pressed = true
+				break
+			at += 1
+		if not pressed:
+			return "no row [%s] in the lobby" % [String(wanted)]
+	return company_join(lines)
+
+
+# Finds a node by the name given to it, walking the tree.
+#
+# find_node(name) does not work for nodes the mod creates at runtime: in this engine build they are not
+# registered under the name that was set, so a whole lobby subtree reports as `@@38`. Walking and
+# comparing get_name() does work.
+static func __child_named(root, name):
+	if root == null:
+		return null
+	if String(root.get_name()) == String(name):
+		return root
+	for child in root.get_children():
+		var found = __child_named(child, name)
+		if found != null:
+			return found
+	return null
+
+
+# The first LineEdit under a node, found by walking rather than by name.
+#
+# Nodes created at runtime in this build are not registered under the names they were given - the lobby's
+# whole subtree shows up as `@@38` and the like - so find_node("name/value") inside it finds nothing.
+# Walking and asking each node what it can do is the reliable way.
+static func __find_line_edit(node):
+	if node == null:
+		return null
+	if node.has_method("get_text") and node.has_method("set_text") and node.has_method("get_cursor_pos"):
+		return node
+	for child in node.get_children():
+		var found = __find_line_edit(child)
+		if found != null:
+			return found
+	return null
+
+
 static func __own(coop):
 	var lines = []
 	lines.push_back("probe start")

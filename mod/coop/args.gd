@@ -52,8 +52,9 @@ static func parse(args):
 	play = 0.0,
 	play_paused = false,
 	play_release = false,
-	pilot = 0.0,
-	remote = false,
+		pilot = 0.0,
+		remote = false,
+		lobby = true,
 	trace_steps = false,
 	dump = 0.0,
 		research = "",
@@ -72,6 +73,7 @@ static func parse(args):
 		unpause = false,
 		load_save = "",
 		company_choice = "",
+		company_name = "",
 		noautosave = false,
 		map_size = -1,
 		game_speed = -1,
@@ -102,6 +104,9 @@ static func parse(args):
 
 		elif flag == "--coop-company":
 			result.company_choice = value
+
+		elif flag == "--coop-company-name":
+			result.company_name = value
 
 		elif flag == "--coop-server":
 			result.role = "client"
@@ -188,6 +193,9 @@ static func parse(args):
 
 		elif flag == "--coop-pilot":
 			result.pilot = float(value) if value != "" else 40.0
+
+		elif flag == "--coop-lobby":
+			result.lobby = value != "off"
 
 		elif flag == "--coop-trace-steps":
 			result.trace_steps = true

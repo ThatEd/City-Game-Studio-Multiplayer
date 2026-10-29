@@ -20,6 +20,7 @@ proven facts; **unknown** = nobody looked; **wrong** = tried, failed, kept so it
 | Host leaving handled | **proven** on screen — popup, save, main menu |
 | Returning player gets their company back | **proven.** €299,706 against €299,704 stored, office re-interiorated |
 | Three or more players | **unknown.** The protocol is host-plus-N and the relay fans out, but only two have run |
+| A player choosing who they are before entering | **proven.** The lobby lists the host's companies and the game's own create form; the client never enters a world it has not chosen |
 | Installing it for a non-technical player | **wrong.** There is no installer. Two PowerShell commands and a game copy are required |
 | Split screen | **unknown.** Not attempted for this game |
 | Steam invite / friends list | **wrong.** Joining is a typed IP:port |
@@ -37,6 +38,19 @@ proven facts; **unknown** = nobody looked; **wrong** = tried, failed, kept so it
 | Date / clock | Host is authoritative; a client that drifts is corrected, and the correction emits `month` so the HUD repaints | **proven** — clock on screen asserted against the model |
 | Rivals | Simulated on both machines from the same world snapshot; the client's simulation is muted | **derived.** A rival released *after* a client joined has not been watched on both sides |
 | Conventions | Catalogue (`generated`, `announced`) is the world's and is transferred; `planned`/`running`/`archived`/`autoattend` are per-player | **proven** — client 0 planned / 0 running / 0 archived, auto-attend off, catalogue present |
+
+## The lobby and saves
+
+| Subsystem | State | Evidence |
+|---|---|---|
+| Lobby before the game | The client stays in the main menu; the host sends a summary, and the world moves only after a choice | **proven** - screenshot shows the menu with the lobby over it, and the client is not in a game |
+| Lobby lists the world's companies | Built on the host from its own live models, so it cannot disagree with the world | **proven** - `[coop-fresh] Fresh Studio 1 office(s) $300004 (player)` |
+| Start a new company | Opens the game's own `company-item.tscn`, name/logo/specialisation included | **proven** - typed `Neon Workshop`, joined as `[Neon Workshop] studios=1 staff=1` |
+| Take over a company | Through the game's own acquisition path | **proven** - `took over Fresh Studio (bought out through the game's own acquisition)` |
+| Takeover leaves no orphaned staff | Deferred re-seat after the acquisition finishes creating its offices | **partly proven** - the deferral is in place; the reseat log line has not been observed succeed |
+| Per-session, per-player saves | `coop-<session>-<player>.cgs`, through the game's own Save As path | **proven** - `written as coop-Fresh-tester`, and the older `coop-tester.cgs` was untouched |
+| Relay knows which save is whose | `save` and `session` on the company record | **proven** - store holds `save: coop-tester-tester`, `session: coop-tester` |
+| Host adopts a client's identity | **fixed.** A co-op save name is never taken as the world's, and the session name wins over the machine-wide `lastsavegame` | **proven** - host published `Fresh Studio`, not the stale `Saved Studio` |
 
 ## The company
 
