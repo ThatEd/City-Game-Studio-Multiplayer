@@ -116,8 +116,9 @@ wiring, the extracted game scripts, the patched pack, the key.
 |---|---|
 | Release from the UI is unconfirmed | the press fires and spends money; `published` becoming 1 has not been watched |
 | Nobody has looked at the publish-offer list, console panel or map | model values are asserted; the panels are not |
-| Per-player progression over a year is unmeasured | `game-engine`, `game-type`, `capacity`, `game-of-the-year`, `game-combos` are isolated, not observed |
+| Per-player progression over a year is unmeasured | `game-engine`, `game-type`, `capacity`, `game-of-the-year`, `game-combos` are isolated, not observed. The clock side is now covered: a 1976→1985 run held both machines on the same week |
 | Three or more players | the protocol allows it; only two have run |
 | No installer | two commands and a game copy are required |
 | Split screen | not attempted |
 | An intermittent join stall | ~1 run in 12, undiagnosed |
+| An intermittent host crash at `0x5111bb` | seen once, on the host, right after `company section holds ...(0 offices)`; three repeats with identical flags did not reproduce it. It is an out-of-bounds array read in game code, on a path this project does not touch. A company with **zero** offices is a state the game iterates over without guarding, which is the lead to follow |
