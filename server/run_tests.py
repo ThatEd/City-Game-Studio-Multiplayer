@@ -65,6 +65,22 @@ class Client:
             out.append(message)
         return out
 
+    def wait_for(self, kind, seconds=3.0):
+        """Waits for one message of a kind and returns it, or None.
+
+        Fixed sleeps are how this suite produced false failures: two cases asserted on state the relay
+        had not been reached yet, and whether they passed depended on how busy the machine was. A test
+        that waits for the condition is slower and honest; a test that sleeps and hopes is neither.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            message = self.receive(timeout=max(0.05, deadline - time.time()))
+            if message is None:
+                return None
+            if message.get("t") == kind:
+                return message
+        return None
+
     def close(self):
         self.sock.close()
 
@@ -254,6 +270,95 @@ def test_departure_is_reported_to_the_host(server, port):
     host.close()
 
 
+def test_a_departure_reaches_the_other_players(server, port):
+    """With three players, the second client hears that the third has gone.
+
+    Only the host was told. With two players there is nobody else to tell, so the gap was invisible: it
+    took a three-player run for the second client to be found still listing a departed player as
+    present, and still holding the company of somebody who had closed the game.
+    """
+    host = Client(port)
+    host.send({"t": "role", "role": "host", "player": "h", "name": "hosty"})
+    one = Client(port)
+    one.send({"t": "role", "role": "client", "player": "c1", "name": "one"})
+    two = Client(port)
+    two.send({"t": "role", "role": "client", "player": "c2", "name": "two"})
+    time.sleep(0.3)
+    two.close()
+    time.sleep(0.2)
+    host_seen = [m for m in host.drain(1.5) if m["t"] == "peer_left"]
+    one_seen = [m for m in one.drain(1.5) if m["t"] == "peer_left"]
+    assert host_seen and host_seen[0]["player"] == "c2", host_seen
+    assert one_seen and one_seen[0]["player"] == "c2", one_seen
+    # The departed player must not be told about their own departure.
+    assert not [m for m in one_seen if m["player"] == "c1"], one_seen
+    host.close()
+    one.close()
+
+
+def test_a_world_is_sent_only_to_the_player_who_asked(server, port):
+    """A join must not re-send the world to players already in it.
+
+    Every join used to fan the whole snapshot out to every client. With two players the existing one
+    simply ignored the second copy; with three, the first client received the world twice and the cost
+    was hundreds of parts of a multi-megabyte transfer per join.
+    """
+    host = Client(port)
+    host.send({"t": "role", "role": "host", "player": "h", "name": "hosty"})
+    one = Client(port)
+    one.send({"t": "role", "role": "client", "player": "c1", "name": "one"})
+    two = Client(port)
+    two.send({"t": "role", "role": "client", "player": "c2", "name": "two"})
+    time.sleep(0.3)
+    one.drain(0.5)
+
+    host.send({"t": "world_begin", "count": 1, "for": "c2"})
+    host.send({"t": "world_part", "name": "map", "i": 0, "of": 1, "data": "[]"})
+    host.send({"t": "world_end"})
+    time.sleep(0.5)
+
+    got_two = [m["t"] for m in two.drain(1.0) if str(m["t"]).startswith("world")]
+    got_one = [m["t"] for m in one.drain(1.0) if str(m["t"]).startswith("world")]
+    assert "world_part" in got_two and "world_end" in got_two, got_two
+    assert not got_one, f"the player already in the world was sent it again: {got_one}"
+    host.close()
+    one.close()
+    two.close()
+
+
+def test_a_broken_log_handle_does_not_kill_the_relay(server, port):
+    """Logging must not be able to end the session.
+
+    This is not hypothetical. tools/run-three.ps1 started the relay with stdout redirected, print()
+    raised OSError(22, "Invalid argument") on the very first `role` message, and the exception left
+    serve_forever() - so the relay died one message into a three-player session while all three game
+    instances stayed healthy. What the players saw was a world that stopped updating for no reason.
+
+    Tested by calling log() directly with both of its outputs broken. The first version of this case
+    drove the relay over the socket instead, and passed even with the print guard removed - because the
+    message-handling try/except added at the same time caught it first. A test that passes in both
+    directions proves nothing, so this one targets the function under test.
+    """
+    class _Broken:
+        def write(self, _text):
+            raise OSError(22, "Invalid argument")
+
+        def flush(self):
+            raise OSError(22, "Invalid argument")
+
+    saved_stdout = sys.stdout
+    saved_file = server.log_file
+    sys.stdout = _Broken()
+    server.log_file = _Broken()
+    try:
+        server.log("a line that cannot be written anywhere")
+    except OSError as exc:
+        raise AssertionError(f"a failed log write killed the relay: {exc!r}") from exc
+    finally:
+        sys.stdout = saved_stdout
+        server.log_file = saved_file
+
+
 def test_a_returning_player_gets_their_company_back(server, port):
     """A player's company is kept by the relay, and handed back when they return.
 
@@ -272,17 +377,24 @@ def test_a_returning_player_gets_their_company_back(server, port):
     saved["offices"] = [{"t": "tile-1", "n": "Home"}]
     saved["layouts"] = [{"t": "tile-1", "items": [{"id": "22"}]}]
     saved["games"] = [{"id": "g1", "name": "A Game", "theme": "space"}]
-    # The host publishes a *table* of companies, which is what the relay stores from.
+    # The host publishes a *table* of companies, which is what the relay stores from. Waited for, not
+    # slept through: how long the relay takes to have already stored it depends on the machine's load.
     host.send({"t": "companies", "companies": [saved]})
-    time.sleep(0.4)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and server.store.load("c9") is None:
+        time.sleep(0.05)
 
     # That player now arrives.
     arriving = Client(port)
     arriving.send({"t": "role", "role": "client", "player": "c9", "name": "nine"})
     arriving.send({"t": "join_request", "player": "c9"})
-    messages = arriving.drain(1.5)
-    replayed = [m for m in messages if m["t"] == "company"]
-    assert replayed, messages
+    replayed = []
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not replayed:
+        message = arriving.receive(timeout=0.5)
+        if message is not None and message.get("t") == "company":
+            replayed.append(message)
+    assert replayed, "the relay never replayed the stored company"
     record = replayed[0]["company"]
     assert record["id"] == "c9", record
     assert record["fanbase"] == 4321, record
@@ -309,9 +421,12 @@ def test_a_leaving_client_keeps_its_last_company(server, port):
     client.send({"t": "role", "role": "client", "player": "c1", "name": "one"})
     time.sleep(0.3)
 
-    # The host's periodic table, from before the client did anything else.
+    # The host's periodic table, from before the client did anything else. Waited for rather than slept
+    # through: the two flaky cases in this suite were both asserting on state the relay had not reached.
     host.send({"t": "companies", "companies": [company("c1", fanbase=100, note=10)]})
-    time.sleep(0.4)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and server.store.load("c1") is None:
+        time.sleep(0.05)
 
     # The client plays on. This is the part that exists nowhere else yet.
     later = company("c1", fanbase=999, note=42)
@@ -320,15 +435,20 @@ def test_a_leaving_client_keeps_its_last_company(server, port):
 
     # The host dies, and the relay tells the client before closing its socket.
     host.close()
-    messages = client.drain(2.0)
-    assert [m for m in messages if m["t"] == "host_left"], messages
+    told = client.wait_for("host_left", 5.0)
+    assert told is not None, "the client was never told the host had gone"
 
     # The client hands over what it has on the way out.
     client.send({"t": "company", "company": later})
-    time.sleep(0.6)
+    deadline = time.time() + 5.0
+    kept = None
+    while time.time() < deadline:
+        kept = server.store.load("c1")
+        if kept is not None and kept.get("fanbase") == 999:
+            break
+        time.sleep(0.05)
     client.close()
 
-    kept = server.store.load("c1")
     assert kept is not None, "the player's company was lost with the host"
     assert kept["fanbase"] == 999, kept
     assert kept["offices"] == [{"t": "tile-9", "n": "Studio"}], kept
@@ -419,6 +539,9 @@ TESTS = [
     ("host company table fans out", test_host_company_table_fans_out),
     ("no host is an answered error", test_no_host_means_an_answered_error),
     ("departure reported to the host", test_departure_is_reported_to_the_host),
+    ("a departure reaches the other players", test_a_departure_reaches_the_other_players),
+    ("a world is only sent to the player who asked", test_a_world_is_sent_only_to_the_player_who_asked),
+    ("a broken log handle does not kill the relay", test_a_broken_log_handle_does_not_kill_the_relay),
     ("a returning player gets their company back", test_a_returning_player_gets_their_company_back),
     ("a leaving client keeps its last company", test_a_leaving_client_keeps_its_last_company),
     ("the stored company survives a new relay", test_the_stored_company_survives_a_new_relay),

@@ -45,6 +45,14 @@ var inbox = ""
 
 var __announced = false
 
+# Every message kind is counted here as it crosses the socket, in both directions. Without this the
+# question "has this call ever run?" can only be answered from memory, and memory said yes to things
+# that had never been on the wire: the verify suite asserted model values, never that the code that
+# moves them had executed. Counting at the transport boundary is the one place that cannot miss a
+# kind, because every kind has to pass through send() or poll().
+var census_sent = {}
+var census_received = {}
+
 
 func connect_to(host, target_port):
 	address = host
@@ -146,6 +154,8 @@ func poll():
 		if message.parse_json(body) != OK:
 			last_error = "server sent unparsable JSON"
 			continue
+		if message.has("t"):
+			__count(census_received, String(message["t"]))
 		messages.push_back(message)
 
 	return messages
@@ -154,6 +164,9 @@ func poll():
 func send(message):
 	if not is_live():
 		return false
+
+	if message.has("t"):
+		__count(census_sent, String(message["t"]))
 
 	var body = message.to_json()
 	var byte_count = body.to_utf8().size()
@@ -188,3 +201,27 @@ func close():
 func __trace(text):
 	if trace_name != "":
 		coop_log.info(trace_name, "trace: " + text)
+
+
+func __count(table, kind):
+	if table.has(kind):
+		table[kind] = int(table[kind]) + 1
+	else:
+		table[kind] = 1
+
+
+# "kind=count" pairs, sorted, so two logs can be diffed and a missing kind is obvious.
+static func census_text(table):
+	var kinds = table.keys()
+	kinds.sort()
+	var parts = []
+	for kind in kinds:
+		parts.push_back("%s=%s" % [kind, String(table[kind])])
+	if parts.size() == 0:
+		return "none"
+	var text = ""
+	for part in parts:
+		if text != "":
+			text += " "
+		text += String(part)
+	return text

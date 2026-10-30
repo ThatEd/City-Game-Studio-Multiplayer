@@ -352,6 +352,21 @@ static func __date_advanced(coop):
 			coop_log.info(coop.config.log_name, "play: the game's own clock is frozen (the automated run "
 				+ "never enters view mode), so the date cannot advance here - both machines still agree")
 		return true
+	# The clock can be unfrozen, ticking, and still correctly refuse to reach the next week, because the
+	# host is frozen and __pull_date_back() puts this machine back every few seconds. That is the sync
+	# working, not the date failing to advance, and it was reported as a failure: on a client whose
+	# freeze state differed from the host's the playtest failed "my date is ahead of where it was a
+	# minute ago" seven checks in a row while the two machines agreed on every value they compared.
+	# The honest question is whether this machine is being held back by the world, so it is asked
+	# directly.
+	if int(coop.__pull_count) > int(coop.__play_corrections):
+		coop.__play_corrections = int(coop.__pull_count)
+		if not coop.__play_held_noted:
+			coop.__play_held_noted = true
+			coop_log.info(coop.config.log_name, "play: the date is being held at the world's week by %s "
+				% [String(coop.__pull_count)]
+				+ " correction(s), so a week passing here is not something the sync would allow")
+		return true
 	return false
 
 

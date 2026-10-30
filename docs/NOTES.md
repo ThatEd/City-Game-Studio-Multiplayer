@@ -1879,3 +1879,288 @@ quit after 900 s (test mode)                    <- killed before the screen coul
 `run-coop.ps1` now stops the host first and gives the client `-DisconnectGrace` (90 s) on top, so the
 save, the hand-over, the screen and the return all have room. A test harness that cannot reach the code
 it is meant to test is the same failure as a guard that cannot fail.
+
+---
+
+# Pass 27: the census, and three players
+
+This pass started from a question the project could not answer: **which of the mod's calls have
+actually run?** Every claim so far was backed by reading model values, which says the world ended up
+right and says nothing about which code moved it. A transfer that was never offered leaves the currency
+model perfectly consistent.
+
+## The census
+
+`link.gd` now counts every message kind as it crosses the socket, in both directions, and
+`main.gd` writes the tally to `<log>-census.txt` whenever it changes - not only at quit, because a crash
+is exactly the run whose coverage you most want. The count is at the transport boundary, so no kind can
+miss it: everything goes through `send()` or `poll()`.
+
+The first two-player lobby session put **6 of 30 kinds** on the wire:
+
+```
+host   sent clock=154 companies=31 events=1 role=1 session_summary=1
+       received join_request=1 state=147
+client sent join_request=1 role=1 state=139
+       received clock=135 companies=27 company=1 session_summary=1
+```
+
+Everything else - the whole trade protocol, `world_*`, `ping`/`pong`, `host_left`, `time_request`,
+`continue_without`, `peer_left`, `acquired`, `digest` - had never run. The rest of this pass was spent
+making them run.
+
+## What was reachable by turning the options on
+
+`tools/run-coverage.ps1` is a run whose purpose is coverage: ping, a money gift in each direction, and
+an explicit lobby pick, all at once.
+
+| Kind | How it was reached | Result |
+|---|---|---|
+| `ping`/`pong` | `--coop-ping` on both | 198 round trips in one run |
+| `world_begin`/`_part`/`_end` | any join | 58 parts, 53 models |
+| `offer_request`/`offer`/`offer_accept` | client gifts money, host accepts | money moved, 30/30 both sides |
+| `offer_accepted` | the reverse: host gifts, client accepts | needs the *reverse* direction |
+| `time_request` | pressing the real pause button on the client | honoured, then refused in a test run by design |
+| `peer_left` | killing the client | host paused as designed |
+| `continue_without` | the new Continue button | see below |
+| `host_left` | host quits first | both clients saved, screens shown, menus reached |
+| `acquired` | `--coop-buytest` | still not run |
+| `digest` | `--coop-play` | still not run |
+
+### `offer_auto` is on the recipient, not the sender
+
+The first coverage run sent the offer and nothing accepted it. `__maybe_accept()` returns early unless
+*the machine receiving the offer* has `--coop-offer-auto`. The run had armed only the sender, and the
+sender's own log line says `auto=True` - which is true and irrelevant, because the sender is never asked.
+So the accept half stayed untested while the log looked like it had been exercised. Fixed in the harness;
+the transfer then settled in both directions.
+
+## The Continue action did not exist
+
+`__confirm_continue()` is reachable only from an inbound `continue_without`, and **nothing sent one**.
+The host was told, on every departure:
+
+> Paused: the host must confirm whether to carry on without them (`--coop-continue-without`, or the
+> Multiplayer panel's Continue action)
+
+There was no Continue action. A host whose player left was paused with no way to disagree except a
+command-line flag fixed at launch or killing the process. The panel now has "Continue without them",
+and the flow is verified end to end: `peer_left` -> paused -> button pressed -> `continue_without` sent ->
+clock resumes.
+
+Its pause also had to be made to *survive*. `__hold_test_speed()` puts the clock back the way the run
+asked for, and it was clearing this pause **one second after it was set** - so the host logged "Paused:
+the host must confirm" and was running again before anybody could read it. `__awaiting_continue` now
+excludes that pause from the speed holder, and `date` reports `paused=True` until the host decides.
+
+## Three players, and what it found in an hour
+
+Three players had never run. `tools/run-three.ps1` starts one host and two clients, waiting for each to
+be in before the next arrives.
+
+**Bug 1 - a rival created mid-session never got its name into the catalogue.** `company.apply()` wrote
+`catalogue[id]` only in the `else` branch, i.e. only when the rival already existed. A company that
+appeared while this machine was already playing was spawned but never catalogued, and the catalogue is
+what the rival list reads its label from. With two players this cannot happen: the rival either exists
+already or arrives with the world transfer. With three, the first client showed the third player's
+company as `coop-underdog` while the host and the third player showed "Underdog Studio".
+
+**Bug 2 - a departure reached only the host.** The relay sent `peer_left` to the host and to nobody else.
+With two players there is nobody else. With three, the second client kept listing the departed player as
+present, and kept the company of somebody who had closed the game, for the rest of the run.
+
+**Bug 3 - every join re-sent the whole world to everyone.** `world_begin`/`world_part`/`world_end` were
+fanned out to every client. A player already in the world ignored the copy through `__on_world`'s
+already-received guard; the cost was hundreds of parts of a multi-megabyte transfer per join. The
+transfer is now addressed: `world_begin` carries `for`, and the relay remembers the address for the
+duration of the transfer rather than tagging every part. A host that sends no address keeps the old
+behaviour.
+
+**Bug 4 - a client published a company table.** The `peer_left` handler ran `__host_publish_companies()`
+and `__pause()` on clients too, because the pause was guarded by `config.role == "host"` and the publish
+was not. A client that is told about a departure now only marks the player absent.
+
+**Bug 5 - a fanned-out lobby summary restarted a playing client's lobby.** The host sends one summary per
+joining player, and the relay fans out everything the host sends. When the third player joined, the first
+client was handed *their* summary, re-ran the whole path - overwriting its own save id with the session
+name, logging "this world is save [...]" a second time, and calling `__show_lobby_choices()` on a player
+who had been playing for minutes. Twice, that client then left the session mid-game. A summary is now
+ignored unless it is addressed to this player.
+
+## The relay could be killed by its own log line
+
+The most serious find of the pass, and it was invisible for two runs.
+
+`tools/run-three.ps1` started the relay with its stdout redirected. `print()` raised
+`OSError(22, "Invalid argument")` on the first `role` message, and the exception went all the way out of
+`serve_forever()`. The relay died one message into the session **while all three game instances stayed
+perfectly healthy**, so what the players saw was a world that stopped updating for no reason. Then the
+next bug compounded it: the first client never noticed its connection had gone and kept running against a
+dead world for eighteen minutes, which looked like a client bug.
+
+Three fixes:
+
+- `log()` cannot raise: both outputs are wrapped. A log line is the least important thing the server
+  does, so it must be the thing that is allowed to fail.
+- Message handling is wrapped, so one bad message cannot end the session for everybody.
+- `drop()` is idempotent and the event loop re-checks registration, because a dropped socket stayed
+  readable and kept being processed - one real drop became a stream of "disconnected" lines.
+
+The relay now also records *why* a connection ended (errno and message, a clean FIN, or a write failure),
+because "disconnected" with no reason cost most of this pass. Two of the error paths here had been
+swallowing the distinction between a reset, a broken pipe and a clean close.
+
+## Two relay tests that were lying
+
+`the stored company survives a new relay` and `a leaving client keeps its last company` failed about one
+run in three, and passed on rerun. Both asserted on state the relay had simply not reached yet, behind
+fixed `time.sleep()` calls. They now wait for the condition. Four consecutive clean runs after the
+change; the project's rule is that a harness which produces false results is worse than no harness.
+
+One of the new cases had the same defect in the opposite direction: `a broken stdout does not kill the
+relay` passed **with the print guard removed**, because the message-handling wrapper added at the same
+time caught the exception first. It now calls `log()` directly with both outputs broken, and was proven
+to fail with the guard removed and pass with it restored.
+
+## The out-of-bounds host crash, named
+
+`0x5111bb` was previously recorded as "an out-of-bounds array read in game code, seen once with 0
+offices, not reproducible". It reproduced, and the machine code names it exactly:
+
+```
+1405111a5  lea  rdx, [rip + 0x74a574]     "SEVERE: Index p_index out of size (size())."
+1405111ac  lea  rcx, [rip + 0x86379d]     "z:\core\vector.h"
+1405111b3  call 0x140a18240
+1405111b8  mov  rcx, rdi                  rdi is NULL
+1405111bb  add  r15d, dword ptr [rcx + 0x28]   <== FAULT
+```
+
+`Vector<struct RichTextLabel::Line>::operator[]`, `core\vector.h:137`. After the bounds error is
+reported, the code dereferences the null the lookup returned. The only `RichTextLabel` the game scripts
+give a class is the console panel (`src/scripts/game/console/output.gd`), and nothing in the mod touches
+it. Two occurrences correlate with a client joining and the world advancing, not with anything the mod
+does to a RichTextLabel.
+
+`tools/name-fault.py <rva>` and `tools/read-cstring.py` are the two tools that produced this, so the next
+fault is named in minutes rather than guessed at for days.
+
+## Where it stands after this pass
+
+- **Three players: 32 checks passed, 0 failed on all three machines**, and the full disconnect path ran
+  on both clients independently (save 5246 ms / 5245 ms, screen, menu).
+- **16 relay cases**, stable across repeated runs.
+- **24 build guards**, including a new one that refuses a function nothing calls - see FAIL-POINTS.
+- Kinds still never on the wire: `acquired` (`--coop-buytest` never run), `digest` (`--coop-play` never
+  run), `session_request` (nothing sends it; now logs a warning saying so).
+
+---
+
+# Pass 28: the last two kinds, and two checks that were lying again
+
+## `digest` runs
+
+`--coop-play=280` runs the two-bot playtest: each machine does what a player does and every minute asks
+the other "what do you actually have?", comparing 14 assertions over the wire. In the final run both
+sides passed all eight rounds:
+
+```
+host   play: check 7 (against coop-tester) passed (14 checks)
+client play: check 8 (against coop-highlan) passed (14 checks)
+       play: clock now raw=146 ... host_raw=146 speed=4 host_speed=4
+```
+
+`digest` went both ways 181 times. This is the only path that produces it.
+
+## `acquired` cannot be exercised, by design
+
+`--coop-buytest=coop-tester` makes the host try to buy every share of a player's company. The answer is
+correct and it is a refusal:
+
+```
+buytest: trying to buy every share of coop-tester, which is a player
+buytest: rival still in the world=True, player studios=1
+net: refused a buyout of coop-tester - that company belongs to a player, so it cannot be acquired
+```
+
+`acquired` is therefore dead code held in reserve: it exists for the case where a buyout succeeds, and
+the guard exists so it cannot. That is the honest end state for that kind - never on the wire in any
+run, and never should be.
+
+Its wait was also broken: `__buy_test_wait` was declared `0.0` and never assigned, so the "the other
+player is not here yet" warning fired on frame one, before their company could possibly have arrived.
+It is armed on the first call now (`BUY_TEST_GRACE`, 60 s).
+
+## A gift could bankrupt the giver
+
+The harness gifted 50000 from a company holding 44627:
+
+```
+trade: money 50000 paid, balance is now -5373
+```
+
+Nothing checked affordability - not at the offer, not at the apply. A negative balance is not a state
+the game models: rent and payroll then run against it, and it made the verify suite fail "own company
+has money" on a machine whose sync was working perfectly. It is refused at both ends now, because an
+offer made minutes ago can outlive the money it was made against. Recorded as a caveat: the poisoned
+balance was then *stored* by the relay and handed back to the next session, so the failure persisted
+across runs until the store record was repaired.
+
+## The playtest check that failed on a healthy machine
+
+The client reported, seven rounds in a row:
+
+```
+play: check 4 FAILED 1 of 14 checks: my date is ahead of where it was a minute ago
+```
+
+while `our dates agree`, `our speed agrees` and `our pause state agrees` all passed. The cause is the
+sync working exactly as designed. In an automated run the *host's* date model stays frozen (the run
+never enters view mode) while the client's does not: the client ticks, reaches the next week, and
+`__pull_date_back()` puts it back every three seconds - twenty times in the run. So the week never
+"passes" locally, which is correct, and the check read that as the date failing to advance.
+
+`__date_advanced()` already had a caveat for a *frozen* clock. It now also recognises a clock that is
+being *held*: if `__pull_count` has risen since the last check, the world is refusing to let this
+machine move on, and a week passing is not something the sync would allow. It says so once and passes.
+After the fix both machines passed all eight rounds.
+
+This needed one more change: `__clock_corrections` stops counting at 20 because each of the first twenty
+gets a log line, so it cannot be used to detect an *ongoing* correction. `__pull_count` counts them all.
+
+## The build guard that found the dead code
+
+`check_dead_functions()` refuses a function nothing calls. Not a style rule - it found three bugs on the
+day it was written, and each was invisible to every test in the suite:
+
+| Dead function | What it was |
+|---|---|
+| `__keep_lobby_on_top()` | the documented fix for a *photographed* bug (the lobby completely covered by the game scene) - written, never wired into `_process`, so the bug it describes was still live |
+| `__run_office_test()` | the only caller of `--coop-officetest`'s plumbing, so from the command line that flag did nothing |
+| `is_coop_save_present()` | a stale duplicate that answered "does the file exist" from `user://`, bypassing the session naming that is the whole point of `saves.gd` |
+
+Two more were found by the check itself once it was correct (`__script_path`, `get_players`) and one by
+reviewing its twelve false positives.
+
+Its first version reported twelve false positives because the matcher excluded dotted names, so
+`__link.debug_line()` - a call on the very next line - did not count as a use. A noisy guard gets
+switched off, so the rule is one-sided on purpose: missing a dead function is milder than crying wolf.
+Proven in both directions in `build_run_tests.py` (must catch a function nothing calls; must leave alone
+one called through a receiver, one called by `call()`, and an engine callback).
+
+Functions legitimately reached by name are listed in `ALLOWED_DEAD`, with the reason each is safe, so
+keeping one is a decision rather than an oversight.
+
+## Where it stands
+
+| | |
+|---|---|
+| Two-player session, all options on | **30/30** on the client, 29/29 on the host |
+| Playtest, 8 rounds | **8/8 on both machines**, 14 assertions each |
+| Three players | **32/32 on all three machines** |
+| Relay | **16 cases**, stable across repeated runs |
+| Build guards | **24**, including the dead-function check |
+| Message kinds on the wire | **29 of 30**; `acquired` is refused by design |
+
+Still never observed: a game released from the UI (`published` becoming 1), the publish-offer list and
+console panel as rendered panels, per-player progression over a year, and the `0x5111bb` RichTextLabel
+fault reproduced on demand.

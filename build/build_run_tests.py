@@ -138,6 +138,43 @@ MUST_PASS = [
 ]
 
 
+# The dead-function guard is a different check with its own two directions, so it is proven separately
+# rather than mixed into the compile-guard lists above: it must catch a function nothing calls, and it
+# must leave alone a function called through a receiver (`__link.debug_line()`), through `call()`, and
+# one that is genuinely never referenced but deliberately allowed.
+DEAD_MUST_CATCH = [
+    (
+        "a function nothing calls",
+        b"func __keep_lobby_on_top():\n"
+        b"\treturn true\n\n"
+        b"func __run(delta):\n"
+        b"\treturn delta\n",
+        "the documented lobby fix that was written and never wired into _process",
+    ),
+]
+
+DEAD_MUST_PASS = [
+    (
+        "called through a receiver",
+        b"var __link = null\n\n"
+        b"func _process(delta):\n"
+        b"\treturn __link.debug_line()\n",
+    ),
+    (
+        "called through call() by name",
+        b"func _process(delta):\n"
+        b"\treturn self.call(\"menu_host_pressed\")\n\n"
+        b"func menu_host_pressed():\n"
+        b"\treturn true\n",
+    ),
+    (
+        "an engine callback with no caller",
+        b"func _ready():\n"
+        b"\treturn true\n",
+    ),
+]
+
+
 def main():
     passed = 0
     failed = []
@@ -164,6 +201,25 @@ def main():
             print("  ok    %-32s passes" % name)
 
     total = len(MUST_CATCH) + len(MUST_PASS)
+    print()
+    print("the dead-function guard")
+    for name, body, why in DEAD_MUST_CATCH:
+        problems = build_mod.check_dead_functions({"res://coop/probe.gd": body})
+        if problems:
+            passed += 1
+            print("  ok    %-32s %s" % (name, problems[0].split(": ", 1)[1][:64]))
+        else:
+            failed.append(name)
+            print("  FAIL  %-32s NOT CAUGHT - %s" % (name, why))
+    for name, body in DEAD_MUST_PASS:
+        problems = build_mod.check_dead_functions({"res://coop/probe.gd": body})
+        if problems:
+            failed.append(name)
+            print("  FAIL  %-32s false positive: %s" % (name, problems[0]))
+        else:
+            passed += 1
+            print("  ok    %-32s passes" % name)
+    total = len(MUST_CATCH) + len(MUST_PASS) + len(DEAD_MUST_CATCH) + len(DEAD_MUST_PASS)
     print()
     print("%d/%d passed" % (passed, total))
     if failed:

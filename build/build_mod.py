@@ -277,6 +277,15 @@ def build(install, out, verify=True):
                 "compile keeps running as its previous version, so every change in it would be "
                 "silently ignored:\n  " + "\n  ".join(script_problems)
             )
+        # Separate from the compile guards above and reported separately: dead code compiles fine, and
+        # the mistake it represents (a fix written but never connected) is invisible to every other
+        # check in this project.
+        dead_problems = check_dead_functions(mod_files)
+        if dead_problems:
+            raise BuildError(
+                "the mod has functions nothing calls, so the work they describe never happens:\n  "
+                + "\n  ".join(dead_problems)
+            )
         result["verified"] = True
     return result
 
@@ -294,6 +303,77 @@ MOD_HELPERS = {    "catalogue", "catalogue_name", "log_studios", "my_home_office
     "empty_studios", "saved_company", "load_company_backup", "first_studio", "capture_models",
     "isolate_store", "make", "describe", "apply", "pending_for", "store", "set_status",
     "is_settled", "field", "text", "number", "flag", "make_id", "__local_id",
+}
+
+
+def check_dead_functions(files):
+    """Refuse to ship a function nothing calls.
+
+    Not a style rule. Three different bugs were found by this check on the day it was written, and
+    each one was invisible to every test in the suite:
+
+    - `__keep_lobby_on_top()` was the documented fix for a real, photographed bug (the lobby was
+      completely covered by the game scene - "the run's screenshot showed the studio, not the
+      lobby"), and nothing ever called it. The fix had been written and never connected, so the bug
+      it describes was still live.
+    - `__run_office_test()` was the only caller of `--coop-officetest`'s plumbing, so from the
+      command line that flag did nothing at all. The function it wrapped was still reached from
+      `__finish_join`, which is why the flag still half-worked and nobody noticed.
+    - `is_coop_save_present()` was a stale duplicate of `saves_lib.is_coop_save()` that answered a
+      different question (does the *file* exist) from `user://`, bypassing the session naming that
+      is the whole point of saves.gd.
+
+    A function may legitimately be unreferenced: a `_`-prefixed engine callback, a script the mod
+    loads by path, or a test helper reached only by name from a command file. Those are listed in
+    ALLOWED_DEAD by name, with a reason, so keeping one is a decision rather than an oversight.
+    """
+    definers = re.compile(r"^func\s+([A-Za-z_]\w*)\s*\(", re.M)
+    problems = []
+
+    texts = {}
+    for name, data in sorted(files.items()):
+        if not name.endswith(".gd"):
+            continue
+        try:
+            texts[name] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+    everything = "\n".join(texts.values())
+    for name, text in sorted(texts.items()):
+        defined = {m.group(1): m.start() for m in definers.finditer(text)}
+        for func in sorted(defined):
+            if func in ALLOWED_DEAD:
+                continue
+            # A definition is one occurrence; anything else is a use, in this file or another. A leading
+            # `.` must count as a use: `__link.debug_line()` is exactly how most of these are called, and
+            # excluding dotted names made the first version of this check report twelve false positives
+            # - including functions called on the very next line. Missing a real dead function is a
+            # milder failure than crying wolf, because a noisy guard gets switched off.
+            uses = len(re.findall(r"(?<!\w)" + re.escape(func) + r"(?!\w)", everything))
+            if uses > 1:
+                continue
+            line = text.count("\n", 0, defined[func]) + 1
+            problems.append(
+                f"{name}:{line}: {func}() is defined and never called; either call it or delete it, "
+                "and add it to ALLOWED_DEAD with a reason if it is meant to be reached by name"
+            )
+    return problems
+
+
+# Functions that are supposed to have no caller in the source, with the reason each is safe.
+ALLOWED_DEAD = {
+    # Reached by the engine, by a script path, or by name from a command file.
+    "_ready", "_process", "_init", "_notification", "_input", "_unhandled_input",
+    "_enter_tree", "_exit_tree", "_fixed_process", "tick",
+    # Godot 2's dispatch verbs, called through call() with a String.
+    "menu_host_pressed", "menu_join_pressed", "menu_multiplayer_pressed",
+    "lobby_cancel_pressed", "lobby_create_back", "lobby_create_confirmed",
+    "lobby_new_pressed", "lobby_takeover_pressed",
+    "ui_accept_offer", "ui_close_panel", "ui_offer_ip", "ui_offer_money",
+    "ui_offer_technology", "ui_refuse_offer", "ui_toggle_panel", "ui_refresh",
+    # remote.gd's own verbs, dispatched the same way.
+    "digest",
 }
 
 

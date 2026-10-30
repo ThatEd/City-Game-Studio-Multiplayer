@@ -1131,11 +1131,19 @@ static func apply(companies, log_name = "coop", logos = null, known_games = null
 			entry.note = note
 			entry.currency = currency
 			entry["coop_name"] = name
-			catalogue[id] = {
-				name = name,
-				logo = logo,
-				engine = {royalties = [25, 35], interval = 108}
-			}
+
+		# The catalogue entry is written for a *newly spawned* rival as well as an updated one. It used
+		# to be written only in the else branch, so the name of a company that appeared while this
+		# machine was already playing never reached the catalogue - and the catalogue is what the rival
+		# list reads its label from. With two players nobody noticed: the rival either existed already or
+		# arrived with the world transfer. With three, the first client saw the third player's company
+		# labelled with its raw id, "coop-underdog", while the host and the third player saw
+		# "Underdog Studio". Caught by the verify suite the first time three players ran together.
+		catalogue[id] = {
+			name = name,
+			logo = logo,
+			engine = {royalties = [25, 35], interval = 108}
+		}
 
 		var offices = sync_studios(id, company, name)
 		var games = sync_games(id, company, known_games)

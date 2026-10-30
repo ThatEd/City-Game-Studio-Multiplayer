@@ -13,7 +13,7 @@ which one backs it.
 `python -I run_all_tests.py` runs the first three. All three pass on a machine with no game installed,
 which is the point — a fresh clone is the real test.
 
-## The relay suite: 13 cases
+## The relay suite: 16 cases
 
 ```
 ok   world reaches the joiner, also later
@@ -23,6 +23,9 @@ ok   client company reaches the host and is kept
 ok   host company table fans out
 ok   no host is an answered error
 ok   departure reported to the host
+ok   a departure reaches the other players
+ok   a world is only sent to the player who asked
+ok   a broken log handle does not kill the relay
 ok   a returning player gets their company back
 ok   a leaving client keeps its last company
 ok   the stored company survives a new relay
@@ -41,6 +44,30 @@ Three of these were **rewritten** when the contract changed, not loosened:
 - "the auto flag reaches the host" is new, and it is a bug that cost a whole class of runs: the relay
   dropped `auto` when forwarding `join_request`, so every unattended join arrived looking interactive
   and the client waited for a lobby nobody could press.
+
+The last four are three-player bugs, and all four were invisible with two players:
+
+-  departure reaches the other players — the relay told only the host. With two players there
+  is nobody else to tell, so a third client kept a departed player listed as present for a whole run.
+-  world is only sent to the player who asked — every join re-sent the entire world to every client
+  already in it, which those clients ignored. Hundreds of parts of a multi-megabyte transfer per join.
+-  broken log handle does not kill the relay — the worst of them. Started with stdout redirected,
+  print() raised and the exception left serve_forever(): the relay died one message into a session
+  while all three games stayed healthy, and the players saw only a world that stopped updating.
+-  world is only sent to the player who asked and  departure reaches the other players both come from
+  the same run.
+
+### Cases that were lying
+
+	he stored company survives a new relay and  leaving client keeps its last company failed about one
+run in three and passed on rerun. Both asserted on state the relay had not reached yet, behind fixed
+	ime.sleep() calls; both now wait for the condition. Four consecutive clean runs after the change.
+
+ broken log handle does not kill the relay had the same defect in the other direction: its first version
+drove the relay over the socket and passed **with the print guard removed**, because the message-handling
+wrapper added at the same time caught the exception first. It now calls log() directly with both outputs
+broken, and was proven to fail with the guard removed and to pass with it restored. A case that passes in
+both directions is worse than none.
 
 ## The in-game suite
 
@@ -68,6 +95,8 @@ were defects in the *checks*, not in the session:
 |---|---|---|
 | `date does not run ahead of the world` | measured the local date against `__host_raw`, which nothing ever set **on the host** — it sent its clock inline and never recorded its own values, so "the world" was a value from the join, twenty weeks stale. A host failing its own check | the host records the values it broadcasts. `local 31 vs world 31` |
 | `this machine knows the shared convention catalogue` | counted `generated + announced`, which hold only conventions generated *this session* — legitimately empty in a young game. The list a player sees is `list_existing_conventions()` | asks the game for the list it would show a player, and reports the other two alongside. `126 entr(ies); 0 generated here, 0 announced` |
+| `my date is ahead of where it was a minute ago` (playtest) | expected a week to pass. On a client whose date model is *not* frozen while the host's is, the client ticks to the next week and `__pull_date_back()` puts it back every three seconds — the sync working. The check read that as the date failing to advance, and failed seven rounds in a row while `our dates agree`, `our speed agrees` and `our pause state agrees` all passed | recognises a date being *held* (`__pull_count` rising) as the sync refusing to let this machine move on, says so once, and passes. Both machines now pass all eight rounds |
+| `own company has money` (verify) | failed on a machine whose sync was perfect, because a gift had been allowed to overdraw the giver to **-5373**. Nothing checked affordability, at the offer or at the apply | refused at the offer and again at the apply, because an offer can outlive the money it was made against. The poisoned balance had also been *stored* by the relay and handed back to the next session, so the failure outlived the run until the store record was repaired |
 
 Both failed on healthy machines, which is worse than not checking at all: a suite that cries wolf
 teaches you to skim its output, and this project has already lost runs to a check that was quietly
@@ -84,8 +113,10 @@ This is the honest part, and it is why the README's "where it stands" table is s
 | Release from the UI | the press fires and spends money; `published` becoming 1 has not been watched |
 | Rivals released after a client joined | the mute is applied periodically, but the case has not been observed on both sides |
 | Per-player progression over a year | `game-engine`, `game-type`, `capacity`, `game-of-the-year`, `game-combos` are isolated; their effect over a played year is unmeasured |
-| Three or more players | only two have ever run |
+| Four or more players | three now run together — 32/32 on all three machines including the full disconnect path on both clients — but the relay has never carried more, and has never been under load from more than three |
 | A long session under load | the longest was several in-game years in one hand-driven session |
+| A date model that is *not* frozen on the client | in an automated run the host's date stays frozen and the client's does not, so the client ticks and is pulled back every three seconds. That exercises the correction path constantly, but both machines running and advancing *together* is only proved by the hand-driven runs |
+| Two kinds that are refused, not untested | `acquired` has never been on the wire and should not be: the buyout guard refuses a player's company by design. `session_request` has never been sent by anything. 29 of 30 kinds have run |
 
 ## Driving the real UI, not a script
 

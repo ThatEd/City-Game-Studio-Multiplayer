@@ -33,6 +33,7 @@ import selectors
 import socket
 import sys
 import time
+import traceback
 
 PREFIX = 8
 MAX_MESSAGE = 64 * 1024 * 1024
@@ -144,13 +145,31 @@ class Server:
         self.stats_bytes = 0
         self.store = CompanyStore(store_dir)
         self.stats_saved = 0
+        # The player a world transfer in progress is addressed to, or None for "everyone". See
+        # forward_to_clients: a joining player needs the world, a player already in it does not.
+        self.world_target = None
 
     def log(self, text):
         line = f"[{now()}] {text}"
-        print(line, flush=True)
+        # Neither output may kill the relay.
+        #
+        # This is not defensive noise: it happened. A relay started with its stdout redirected - which
+        # is exactly how tools/run-three.ps1 started it - raised OSError(22, "Invalid argument") from
+        # print() on the very first `role` message, and the exception went all the way out of
+        # serve_forever(). The relay died one message into the session while every game instance stayed
+        # perfectly healthy, so the symptom was three players sitting in a world that mysteriously
+        # stopped updating. A log line is the least important thing the server does; it must be the
+        # thing that is allowed to fail.
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError):
+            pass
         if self.log_file:
-            self.log_file.write(line + "\n")
-            self.log_file.flush()
+            try:
+                self.log_file.write(line + "\n")
+                self.log_file.flush()
+            except (OSError, ValueError):
+                pass
 
     # --- lifecycle ------------------------------------------------------
 
@@ -182,7 +201,9 @@ class Server:
                     continue
 
                 client = key.data
-                if _events & selectors.EVENT_READ:
+                # Both halves are guarded by "is this client still registered": a read can drop the
+                # client, and the same select() result can still list it.
+                if _events & selectors.EVENT_READ and self.clients.get(client.sock) is client:
                     self.read(client)
                 if self.clients.get(client.sock) is client and _events & selectors.EVENT_WRITE:
                     self.flush(client)
@@ -218,8 +239,14 @@ class Server:
         self.selector.register(sock, selectors.EVENT_READ, client)
         self.log(f"connected {client.label()}")
 
-    def drop(self, client):
-        self.log(f"disconnected {client.label()}")
+    def drop(self, client, reason=""):
+        # Idempotent. The event loop iterates the result of one select() call and can reach the same
+        # client twice, and a socket that has been closed but not unregistered stays readable forever -
+        # so a second drop() logged "disconnected" again and, worse, recv() on the closed socket kept
+        # raising and kept being reported. One drop per client, and it must be the one that removes it.
+        if client.sock not in self.clients:
+            return
+        self.log(f"disconnected {client.label()}" + (f" [{reason}]" if reason else ""))
         try:
             self.selector.unregister(client.sock)
         except (KeyError, ValueError):
@@ -249,6 +276,16 @@ class Server:
             return
         if client is not host and host is not None and client.player_id:
             self.send(host, {"t": "peer_left", "player": client.player_id})
+            # Every *other* player is told too, not only the host. With two players there is nobody
+            # else to tell, which is why this went unnoticed: with three, the second client kept
+            # listing the departed player as present for the rest of the run, and its rival list kept a
+            # company that no longer had anybody behind it. The host answers a peer_left by pausing and
+            # asking whether to carry on; a client answers it by noticing somebody is gone.
+            for remaining in self.client_list():
+                if remaining is client or remaining.player_id == client.player_id:
+                    continue
+                self.send(remaining, {"t": "peer_left", "player": client.player_id})
+                self.log(f"told {remaining.label()} that {client.player_id} left")
 
     # --- helpers --------------------------------------------------------
 
@@ -269,11 +306,23 @@ class Server:
         except BlockingIOError:
             # Woken for a write, or a spurious readable event: nothing to take.
             return
-        except OSError:
+        except OSError as exc:
+            # The reason matters. In a three-player run a client was dropped here with the log saying
+            # only "disconnected", and the client itself never noticed: it kept sending, with its socket
+            # in a state its own StreamPeerTCP never reported as closed, for the rest of the run. The
+            # players' evidence is not enough to tell a reset from a broken pipe from a timeout, and the
+            # three are fixed in different places, so the errno and its message are recorded.
+            self.log(f"read failed on {client.label()}: {exc!r} (errno {exc.errno})")
+            self.drop(client)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"read raised on {client.label()}: {exc!r}")
             self.drop(client)
             return
 
         if not chunk:
+            # A clean FIN: the peer closed its side. Distinguished from the errors above on purpose.
+            self.log(f"{client.label()} closed its side of the connection")
             self.drop(client)
             return
 
@@ -301,7 +350,15 @@ class Server:
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 self.log(f"bad JSON from {client.label()}: {exc}")
                 continue
-            self.handle(client, message, len(body))
+            # Last line of defence for the whole session. One malformed or unexpected message from one
+            # client must not end the relay for everybody: an uncaught exception here propagates out of
+            # serve_forever() and stops the fan-out for every player at once, while all the game
+            # instances stay healthy and simply stop hearing from each other.
+            try:
+                self.handle(client, message, len(body))
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"handling {message.get('t')!r} from {client.label()} failed: {exc!r}")
+                self.log(traceback.format_exc().replace("\n", " | "))
 
     def handle(self, client, message, size):
         kind = message.get("t")
@@ -348,9 +405,21 @@ class Server:
             return
 
         if client.role == "host":
-            self.forward_to_clients(message, size)
+            # A world transfer is addressed to the player who just chose their company. `world_begin`
+            # carries the address, `world_part`/`world_end` do not, so the relay remembers it for the
+            # duration of the transfer rather than putting a tag on every one of hundreds of parts.
+            # A host that sends no address (an older mod) keeps the old fan-out behaviour.
+            only = None
+            if kind == "world_begin":
+                only = str(message.get("for", "")) or None
+                self.world_target = only
+            elif kind in ("world_part", "world_end"):
+                only = self.world_target
+            self.forward_to_clients(message, size, only)
             if kind == "world":
                 client.world = message
+            elif kind == "world_end":
+                self.world_target = None
             elif kind == "companies":
                 # The host publishes the whole company table every few seconds, so this is where each
                 # player's company is kept current while they are connected. Storing from the table (not
@@ -380,13 +449,25 @@ class Server:
         if host is not None:
             self.send(host, message)
 
-    def forward_to_clients(self, message, size):
+    def forward_to_clients(self, message, size, only=None):
         for client in self.client_list():
+            # A world snapshot can be addressed to one player. Without this, every join re-sent the whole
+            # world - megabytes, split into hundreds of parts - to *every* client already playing, and
+            # their `__on_world` ignored it. Invisible with two players, expensive and confusing with
+            # three, and the third player's lobby summary listed a world it had to throw away.
+            if only is not None and client.player_id != only:
+                continue
             self.send(client, message)
         self.stats_forwarded += 1
         self.stats_bytes += size
 
     def send(self, client, message):
+        # A dropped client can still be named by a loop that built its list from an earlier moment (the
+        # host-left fan-out, the company table, the world replay). Writing to it produced a cascade of
+        # "write failed" lines for every later message, which buries the one line that says why the
+        # connection actually ended.
+        if client.sock not in self.clients:
+            return
         # ensure_ascii is explicit: the game reads frames as a String and uses the byte length from
         # the prefix as a character offset, which is only correct while everything on the wire is
         # ASCII. json.dumps escapes anything else by default; keep it that way.
@@ -395,13 +476,16 @@ class Server:
         self.flush(client)
 
     def flush(self, client):
+        if client.sock not in self.clients:
+            return
         if client.out:
             try:
                 sent = client.sock.send(client.out)
             except BlockingIOError:
                 sent = 0
-            except OSError:
-                self.drop(client)
+            except OSError as exc:
+                self.log(f"write failed to {client.label()}: {exc!r} (errno {exc.errno})")
+                self.drop(client, "write failed")
                 return
             if sent:
                 del client.out[:sent]

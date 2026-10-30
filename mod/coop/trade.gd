@@ -66,6 +66,15 @@ static func apply(offer, accepting, log_name):
 	if kind == MONEY:
 		var amount = int(payload["amount"])
 		var currency = models.get_model("currency")
+		# A payment the payer cannot afford is refused here as well as at the offer. The giver applies its
+		# own side from the same offer record, and an offer made minutes ago can outlive the money it was
+		# made against - so "did they have it when they offered?" is not the question that matters at the
+		# moment money moves.
+		if not accepting and amount > int(currency.get_currency()):
+			coop_log.warning(log_name, "trade: refusing to hand over %s, this company holds %s" % [
+				String(amount), String(currency.get_currency())
+			])
+			return "money %s refused, the payer cannot cover it" % [String(amount)]
 		# currency.update_currency() *subtracts* its argument (models/currency.gd), so a gain is negative
 		# and a payment is positive. Both sides read the same amount from the same offer.
 		if accepting:

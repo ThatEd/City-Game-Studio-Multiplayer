@@ -178,6 +178,29 @@ static func __build_panel(coop):
 	offers.set_name("offers")
 	box.add_child(offers)
 
+	# --- carrying on without a departed player ------------------------------
+	#
+	# The host is told, when somebody leaves, to "confirm whether to carry on without them
+	# (--coop-continue-without, or the Continue action)" - but there was no Continue action. The mod
+	# paused the world for a player who had gone and offered no way to disagree, so the only exits were
+	# a command-line flag fixed at launch or killing the process. __confirm_continue() existed and was
+	# reachable only from an inbound message nobody sends.
+	var departed_title = Label.new()
+	departed_title.set_text("Carry on without")
+	box.add_child(departed_title)
+
+	var departed_row = HBoxContainer.new()
+	box.add_child(departed_row)
+	var departed = OptionButton.new()
+	departed.set_name("departed")
+	departed.set_custom_minimum_size(Vector2(300, 32))
+	departed_row.add_child(departed)
+	var continue_button = Button.new()
+	continue_button.set_name("continue_without")
+	continue_button.set_text("Continue without them")
+	continue_button.connect("pressed", coop, "ui_continue_without")
+	departed_row.add_child(continue_button)
+
 	return root
 
 
@@ -221,6 +244,19 @@ static func refresh(panel, coop, log_name):
 		__fill_options(games, labels, game_ids)
 
 	__refresh_offers(panel, coop)
+
+	var departed = panel.find_node("departed", true, false)
+	if departed != null:
+		var gone = coop.ui_departed_players()
+		var gone_labels = []
+		var gone_ids = []
+		for entry in gone:
+			gone_labels.push_back(dict_lib.text(entry, "label", "?"))
+			gone_ids.push_back(dict_lib.text(entry, "id", ""))
+		if gone_ids.size() == 0:
+			gone_labels.push_back("nobody has left")
+			gone_ids.push_back("")
+		__fill_options(departed, gone_labels, gone_ids)
 
 
 static func __refresh_offers(panel, coop):
@@ -325,6 +361,10 @@ static func selected_genre(panel):
 
 static func selected_game(panel):
 	return __selected_id(panel.find_node("games", true, false))
+
+
+static func selected_departed(panel):
+	return __selected_id(panel.find_node("departed", true, false))
 
 
 # --- small helpers ------------------------------------------------------

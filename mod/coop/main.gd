@@ -1,4 +1,4 @@
-extends Node
+﻿extends Node
 
 # Co-op mod entry point, loaded as the `coop` autoload (autoload/coop in engine.cfb).
 #
@@ -89,6 +89,10 @@ const COMPANY_MODELS = ["player", "staff", "currency", "fanbase", "game",
 const PING_INTERVAL = 2.0
 # How often a client re-applies the competitor mute.
 const MUTE_INTERVAL = 5.0
+# How long the buy test waits for the other player's company to appear before it says so. A joining
+# player's company arrives with the world transfer and then the company table, which is seconds, not
+# frames; warning on frame one (which is what a never-assigned 0.0 did) reports a healthy world as empty.
+const BUY_TEST_GRACE = 60.0
 # Every signal scripts/models/date.gd declares.
 const DATE_SIGNALS = ["freeze", "unfreeze", "first_week_of_the_month", "monthly_report_reset",
 	"before_end_of_month", "end_of_week", "end_of_month", "new_week", "month", "update_season",
@@ -142,8 +146,19 @@ var __host_raw = -1
 var __host_speed = -1
 var __host_paused = false
 var __clock_corrections = 0
+# Every correction ever made, not only the twenty that get a log line. The playtest reads this to tell
+# "the date cannot advance" apart from "the date is being held at the world's week".
+var __pull_count = 0
 var __overshoot_warned = false
 var __overshoot_noted = false
+var __census_text = ""
+
+# A player's departure pauses the world until the host decides. That pause must survive the test-run
+# speed holder: in a co-op run the speed holder puts the clock back the way the *run* asked for, and it
+# was clearing this pause one second after it was set - so the host logged "Paused: the host must
+# confirm" and was running again before anyone could read it. The pause exists because the departed
+# player's company was mid-state; overriding it silently is the failure it is meant to prevent.
+var __awaiting_continue = ""
 var __next_time_request_at = 0.0
 var __player_states = {}
 var __joining = {}
@@ -445,14 +460,6 @@ func __save_own_company():
 	return "the save manager refused the write"
 
 
-# Whether a co-op save with this name is already on this machine.
-func is_coop_save_present(name):
-	if name == "":
-		return false
-	var file = File.new()
-	return file.file_exists("user://%s.cgs" % [name])
-
-
 # The name of the save this world is.
 #
 # For the host that is whatever save the game loaded, which the game remembers as `lastsavegame`. The mod
@@ -666,6 +673,7 @@ func __poll_network():
 	if __elapsed >= __next_debug_at:
 		__next_debug_at = __elapsed + 1.0
 		coop_log.info(config.log_name, "net: " + __link.debug_line())
+		__flush_census()
 
 	# A regular round trip, to tell "this build cannot read a socket it has written to" apart from
 	# anything specific to joining: each pong lands in the same poll() path a join request would.
@@ -1050,9 +1058,15 @@ func __handle_server_message(message):
 			__pause(true)
 			__broadcast_clock()
 			__maybe_send_logo(true)
-			__send_world()
+			__send_world(joiner)
 
 	elif message["t"] == "session_request":
+		# Nothing in this project sends this: the census is what found it, after the fact. It is kept
+		# because it costs one branch and answers the same question as a lobby summary, but it is logged
+		# rather than passed off as a tested path - a handler nobody can reach is a handler nobody has
+		# verified, and the census now says so by name on every run.
+		coop_log.warning(config.log_name, "net: session_request arrived, which nothing in this project "
+			+ "sends; treating it as a lobby summary")
 		__send_lobby_summary(dict_lib.text(message, "player", ""))
 
 	elif message["t"] == "lobby_pick":
@@ -1067,7 +1081,7 @@ func __handle_server_message(message):
 		__pause(true)
 		__broadcast_clock()
 		__maybe_send_logo(true)
-		__send_world()
+		__send_world(picker)
 
 	elif message["t"] == "offer_request":
 		# A player wants to give something to another player. The host is the register: it records the
@@ -1098,15 +1112,24 @@ func __handle_server_message(message):
 	elif message["t"] == "peer_left":
 		var left = dict_lib.text(message, "player", "")
 		coop_log.info(config.log_name, "net: %s left" % [left])
+		# A client is told about a departure too (the relay tells every other player, not only the
+		# host), and a client must not republish or pause on it: only the host owns the company table
+		# and the clock. Publishing from a client put a whole company table on the wire that the relay
+		# correctly ignored, and ran the host's save-into-world path against the client's own world.
+		if config.role != "host":
+			__mark_present(left, false)
+			return
 		__client_companies.erase(left)
 		# The company stays in the world; only its presence changes. Carrying on without the player is
 		# the host's decision, so time stops until the host says so.
 		__mark_present(left, false)
 		__host_publish_companies()
-		if config.role == "host" and not config.continue_without:
+		if not config.continue_without:
 			__pause(true)
+			__awaiting_continue = left
 			coop_log.warning(config.log_name, "net: %s left. Paused: the host must confirm whether to "
-				% [left] + "carry on without them (--coop-continue-without, or the Continue action)")
+				% [left] + "carry on without them (--coop-continue-without, or the Multiplayer panel's "
+				+ "Continue without them button)")
 
 	elif message["t"] == "time_request":
 		__on_time_request(message)
@@ -1172,7 +1195,7 @@ func __handle_server_message(message):
 
 	elif message["t"] == "continue_without":
 		var who = dict_lib.text(message, "player", "")
-		__confirm_continue(who)
+		__on_continue_without(who)
 
 	elif message["t"] == "acquired":
 		var victim = dict_lib.text(message, "player", "")
@@ -1236,6 +1259,15 @@ func __handle_server_message(message):
 # before the summary it knows nothing about the host's world at all.
 func __on_lobby_summary(message):
 	if config.role != "client":
+		return
+	# A summary addressed to somebody else is not ours. The host sends one per joining player, and the
+	# relay fans everything the host sends out to every client - so when a third player joined, the first
+	# client was handed their lobby summary too and re-ran this whole path: it overwrote its own save id
+	# with the session name, logged "this world is save [...]" a second time, and called
+	# __show_lobby_choices() on a player who had been playing for minutes.
+	var addressed_to = dict_lib.text(message, "for", "")
+	if addressed_to != "" and addressed_to != __local_id():
+		coop_log.info(config.log_name, "lobby: ignoring a summary meant for %s" % [addressed_to])
 		return
 	if not bool(dict_lib.field(message, "ready", false)):
 		var why = dict_lib.text(message, "reason", "not ready")
@@ -1499,6 +1531,8 @@ var __play_digests = {}
 var __play_actions = []
 var __play_stuck = {}
 var __play_last_date = -1
+var __play_corrections = 0
+var __play_held_noted = false
 var __play_was_frozen = false
 var __play_their_date = -1
 var __play_frozen_noted = false
@@ -1745,6 +1779,13 @@ func __run_verify():
 				expected_name = String(saved["name"])
 			if saved.has("games") and saved["games"] != null:
 				expected_games = saved["games"].size()
+		# The company table carries the authoritative name and it arrives every few seconds, whereas the
+		# world's company section is only rewritten by a save. With three players the first client's copy
+		# of the third player's section entry was written before that player had been named, so the
+		# section said "coop-underdog" while the rival list correctly said "Underdog Studio" - and the
+		# check failed on a machine that was right. The table is the better authority.
+		if entry.has("coop_name") and String(entry["coop_name"]) != "":
+			expected_name = String(entry["coop_name"])
 
 		var shown_name = rival
 		if catalogue.has(rival) and catalogue[rival] != null and catalogue[rival].has("name"):
@@ -1869,6 +1910,19 @@ func __find_offer(offer_id):
 
 
 func offer_money(to_id, amount):
+	# A player cannot give away money they do not have.
+	#
+	# There was no check at all: the harness gifted 50000 from a company holding 44627, the payment went
+	# through, and the giver's balance became -5373. A negative balance is not a state the game models -
+	# rent and payroll then run against it - and it made the verify suite fail "own company has money" on
+	# a machine whose sync was working perfectly. Refused at the offer, and again at the apply below,
+	# because an offer can outlive the money it was made against.
+	var have = int(models.get_model("currency").get_currency())
+	if int(amount) > have:
+		coop_log.warning(config.log_name, "trade: cannot offer %s, this company holds %s" % [
+			String(int(amount)), String(have)
+		])
+		return
 	var offer = trade.make(__local_id(), to_id, trade.MONEY, {amount = int(amount)})
 	__send_offer(offer)
 
@@ -2060,7 +2114,20 @@ func lobby_cancel_pressed():
 	if __link != null:
 		__link.close()
 		__link = null
-	coop_log.info(config.log_name, "lobby: cancelled, back to single player")
+	# Who called this? Nobody presses the lobby's Back button in an unattended run, yet a client left the
+	# session mid-game in two three-player runs and logged exactly this line. The panel's leave button is
+	# the only emitter, so either something emits `pressed` on it or the signal is firing from a node that
+	# was replaced. get_stack() names the caller, which is the difference between a guess and a fix.
+	var frames = get_stack()
+	var caller = "?"
+	if frames != null and frames.size() > 0 and frames[0].has("function"):
+		caller = "%s:%s" % [String(frames[0]["source"]), String(frames[0]["line"])]
+		var depth = 0
+		while depth < frames.size() and depth < 4:
+			if frames[depth].has("function"):
+				caller += " <- %s" % [String(frames[depth]["function"])]
+			depth += 1
+	coop_log.info(config.log_name, "lobby: cancelled, back to single player (called from %s)" % [caller])
 
 
 func __lobby_commit(label):
@@ -2082,11 +2149,6 @@ func __lobby_commit(label):
 # Attached to the scene root, not to the main menu. The world transfer pushes the game's loading scene,
 # which replaces the menu - so a lobby parented to the menu would be freed at exactly the moment it
 # became useful. The root outlives every scene change.
-# The lobby panel, if there is one.
-#
-# Attached to the scene root, not to the main menu. The world transfer pushes the game's loading scene,
-# which replaces the menu - so a lobby parented to the menu would be freed at exactly the moment it
-# became useful. The root outlives every scene change.
 func __lobby_panel():
 	var root = get_tree().get_root()
 	return root.find_node(lobby_lib.PANEL_NODE, true, false)
@@ -2102,9 +2164,7 @@ func __ensure_lobby():
 	return panel
 
 
-
-
-
+# Keeps the lobby above the game scene while it is on screen.
 # Keeps the lobby above the game scene while it is on screen.
 #
 # The game adds its own scene to the root after the mod's, so a root-level panel that was visible and
@@ -2400,6 +2460,57 @@ func ui_refuse_offer(offer_id):
 	ui_refresh()
 
 
+# The players whose company is in the world but who are no longer connected. The host can carry on
+# without one of them; their company becomes an ordinary AI rival.
+func ui_departed_players():
+	var out = []
+	if not models.is_loaded() or not models.has_model("coop-state"):
+		return out
+	var coop_state = models.get_model("coop-state")
+	var seen = {}
+	for player_id in coop_state.ids():
+		var rival = String(player_id)
+		if rival == __local_id():
+			continue
+		if __player_present(rival):
+			continue
+		seen[rival] = true
+		out.push_back({
+			"id": rival,
+			"label": "%s (gone)" % [ui_player_name(rival)]
+		})
+	# A player who left before the join wrote their record is still in the world's company table.
+	for rival_id in ui_other_players():
+		var rival = String(rival_id)
+		if seen.has(rival) or __player_present(rival):
+			continue
+		out.push_back({"id": rival, "label": "%s (gone)" % [ui_player_name(rival)]})
+	return out
+
+
+# The Continue action the disconnect warning has always advertised.
+func ui_continue_without():
+	var chosen = ui_lib.selected_departed(__game_panel)
+	if chosen == "":
+		ui_lib.set_status(__game_panel, "nobody has left the session")
+		return
+	coop_log.info(config.log_name, "ui: carrying on without %s" % [chosen])
+	__confirm_continue(chosen)
+	ui_refresh()
+
+
+# The other end of advertising a Continue action: a peer is told, and its own pause is released, when
+# somebody else's departure has been confirmed by the authority.
+func __on_continue_without(player_id):
+	__awaiting_continue = ""
+	__mark_present(player_id, false)
+	if models.has_model("coop-state"):
+		models.get_model("coop-state").set_host_confirmed(player_id, true)
+	coop_log.info(config.log_name, "net: the host is carrying on without %s, their company is an AI "
+		% [player_id] + "rival from here")
+	__pause(false)
+
+
 # Drives the panel the way a player would: opens it from the button, then presses the buttons. What it
 # asserts is what the panel shows and what the world did as a result.
 func __run_ui_test():
@@ -2515,21 +2626,6 @@ func __patch_menu():
 		__menu_warned = true
 
 
-# Ground truth for where the buttons can go: logs the live menu's node tree, which is the only
-# reliable way to learn the paths this game uses (the retail scenes are binary in the pack).
-# Reproduces the reported case without needing a hand-made save: before the company is placed, the
-# player's office is forced into the state that was wrong, and then the normal join path has to come out
-# with one usable office.
-#
-#   --coop-officetest=unfit      an office on a building that is not a home, with no furniture
-#   --coop-officetest=empty      an office on a home building with an empty room (no desk, no computer)
-#   --coop-officetest=rival      an office on a tile another company already owns
-func __run_office_test():
-	if config.office_test == "":
-		return
-	__plant_office_for_test()
-
-
 # Reproduces the reported case: the player arrives already holding an office that is not fit to work in.
 #
 #   --coop-officetest=unfit   an office on a building that is not a home, with no furniture
@@ -2537,7 +2633,9 @@ func __run_office_test():
 #   --coop-officetest=rival   an office on a tile another company already owns
 #
 # Called from __finish_join just before the company is placed, because the world merge empties the
-# studio model and would erase anything planted earlier.
+# studio model and would erase anything planted earlier. This used to be reached through a wrapper
+# (`__run_office_test`) that nothing called, so `--coop-officetest` was a flag that did nothing from
+# the outside; the only live caller is the one in __finish_join.
 func __plant_office_for_test():
 	if __office_tested or config.office_test == "" or not models.is_loaded():
 		return
@@ -3218,6 +3316,9 @@ func __enforce_host_clock():
 func __pull_date_back(date_model, from_date, to_date):
 	__set_date(date_model, to_date)
 	__discard_overshoot(date_model)
+	__pull_count += 1
+	# The first twenty get a line each, because they are the ones worth reading; after that only the
+	# count matters and a line per correction floods the log at four a minute.
 	if __clock_corrections < 20:
 		__clock_corrections += 1
 		coop_log.info(config.log_name, "clock: date pulled back from %s to the world's %s" % [
@@ -3393,29 +3494,7 @@ func __disable_competitor_simulation():
 	elif not __mute_warned:
 		__mute_warned = true
 		coop_log.info(config.log_name, "net: no competitor handlers connected yet "
-			+ "(%s date-signal connections are other things); will retry" % [String(kept)])
-
-
-func __script_path(target):
-	# typeof() first: calling an Object member on a Variant that is not an Object is the same
-	# missing-member crash this build gives for Dictionary.get(). A connection entry can carry
-	# something other than a live Object, so the type is checked before anything is called on it.
-	if typeof(target) != TYPE_OBJECT or target == null:
-		return "?"
-	var script = target.get_script()
-	if script == null:
-		return "?"
-	return String(script.resource_path)
-
-
-# The objects that simulate rivals are not the concurrent* scene nodes: scripts/models/concurrent.gd,
-# concurrent-game.gd, concurrent-staff.gd, concurrent-trading.gd and concurrent-platform.gd each
-# connect their own handlers to the date model. Matching on the script path catches all of them
-# without hard-coding signal names that a game update could rename.
-func __is_competitor(target):
-	if target == null:
-		return false
-	return __script_path(target).find("concurrent") >= 0
+					+ "(%s date-signal connections are other things); will retry" % [String(kept)])
 
 
 # The host decides whether time moves; a client never unpauses itself.
@@ -3490,11 +3569,15 @@ func __apply_company_table(table):
 
 # The host's world, one model per message. A single 8 MB message kills this engine build, so the
 # transfer is split; the client assembles it and only then boots.
-func __send_world():
-	coop_log.info(config.log_name, "net: world encoding start")
+func __send_world(to_player):
+	coop_log.info(config.log_name, "net: world encoding start for [%s]" % [to_player])
 	var encoded = state_sync.encode_models(models.get_data())
 	coop_log.info(config.log_name, "net: world encoding done (%s models)" % [String(encoded.size())])
-	__link.send({"t": "world_begin", "count": encoded.size()})
+	# Addressed, so a player already in the world does not receive megabytes of a snapshot it ignores.
+	# Every join used to re-send the whole world to every existing client. It cost nothing visible with
+	# two players, and with three the first client received the world twice - the second copy thrown
+	# away by __on_world's own already-received guard.
+	__link.send({"t": "world_begin", "count": encoded.size(), "for": to_player})
 
 	var sent = 0
 	var parts_sent = 0
@@ -3825,6 +3908,7 @@ func __log_company():
 func __confirm_continue(player_id):
 	if player_id == "":
 		return
+	__awaiting_continue = ""
 	__mark_present(player_id, false)
 	if models.has_model("coop-state"):
 		var coop = models.get_model("coop-state")
@@ -4048,6 +4132,13 @@ func __run_buy_test():
 	if not models.is_loaded():
 		return
 	# Wait until the player's company actually exists on this machine.
+	#
+	# `__buy_test_wait` was declared as 0.0 and never assigned, so "is this too early to warn?" compared
+	# elapsed time against zero and the give-up warning fired on the first frame, before the other
+	# player's company could possibly have arrived. It is armed on the first call now, which is what the
+	# variable was for.
+	if __buy_test_wait == 0.0:
+		__buy_test_wait = __elapsed + BUY_TEST_GRACE
 	if not __rival_exists(config.buy_test):
 		if __elapsed > __buy_test_wait:
 			if not __buy_test_warned:
@@ -4227,6 +4318,8 @@ func _process(delta):
 	__tick_tutorial()
 	__tick_world_save_id()
 	__tick_takeover_reseat()
+	__keep_lobby_on_top()
+	__trace("lobbytop")
 	__install_buyout_guard()
 	__trace("buyout")
 	__enforce_host_clock()
@@ -4306,6 +4399,7 @@ func _process(delta):
 
 	if config.quit_after > 0.0 and __elapsed >= config.quit_after:
 		coop_log.info(config.log_name, "quit after %s s (test mode)" % [String(config.quit_after)])
+		__report_census()
 		set_process(false)
 		get_tree().quit()
 
@@ -4396,6 +4490,13 @@ func __hold_test_speed():
 	# when a project finishes with no studio director, or the host pausing because a player left. In a test
 	# run all of them are noise, so the clock is put back the way the run asked for.
 	if bool(date_model.paused):
+		# ...unless the pause is the one waiting on the host's decision about a departed player. That is
+		# a decision, not noise, and overriding it is precisely what this holder must not do.
+		if __awaiting_continue != "":
+			var have_speed = int(date_model.get_speed_index())
+			if have_speed != int(config.game_speed_request):
+				date_model.set_speed(int(config.game_speed_request))
+			return
 		__pause(false)
 		coop_log.info(config.log_name, "clock: unpaused the world so the run can advance")
 	var have = int(date_model.get_speed_index())
@@ -4564,11 +4665,82 @@ func __start_clock():
 # ---------------------------------------------------------------------------
 # Report: what the loaded game is, and what its state costs.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Report: which call sites actually ran.
+# ---------------------------------------------------------------------------
+#
+# Written at the end of a test run, beside the log. Everything before this segment was verified by
+# reading model values, which says the world ended up right and says nothing about *which* code moved
+# it: a transfer that was never offered still leaves the currency model consistent. This is the
+# missing half - the set of message kinds that crossed the socket in this run, against the set the
+# mod can send and handle, so the calls that never executed are named instead of assumed.
+
+# Every kind the mod sends or handles, taken from main.gd's own dispatch table and send sites. Kinds
+# the relay sends on its own behalf are marked in the comments.
+const EXPECTED_KINDS = [
+	# from the mod
+	"acquired", "clock", "companies", "company", "continue_without", "digest", "events",
+	"join_request", "joined", "logo", "lobby_pick", "offer", "offer_accept", "offer_accepted",
+	"offer_reject", "offer_rejected", "offer_request", "ping", "role", "session_summary", "state",
+	"time_request", "world_begin", "world_end", "world_part",
+	# from the relay only
+	"error", "host_left", "peer_left", "pong",
+]
+
+# The census, kept on disk as it changes.
+#
+# A crash leaves no quit line and no end-of-run report - and a crash is exactly the run whose coverage
+# you most want to know. Writing it whenever it changes means the file always describes the last frame
+# that ran, whether the process exits or dies.
+func __flush_census():
+	if __link == null:
+		return
+	var text = "role=%s\nsent %s\nreceived %s\n" % [
+		config.role,
+		link_lib.census_text(__link.census_sent),
+		link_lib.census_text(__link.census_received)
+	]
+	if text == __census_text:
+		return
+	__census_text = text
+	coop_log.write_text(config.log_name + "-census.txt", text)
+
+
+func __report_census():
+	if __link == null:
+		return
+	var sent = link_lib.census_text(__link.census_sent)
+	var received = link_lib.census_text(__link.census_received)
+
+	coop_log.info(config.log_name, "census: sent     %s" % [sent])
+	coop_log.info(config.log_name, "census: received %s" % [received])
+
+	# A kind that was neither sent nor received in this run is a call that did not execute. Reported by
+	# name, because a number of missing calls is not actionable and a list of them is.
+	var seen = {}
+	for kind in __link.census_sent.keys():
+		seen[String(kind)] = true
+	for kind in __link.census_received.keys():
+		seen[String(kind)] = true
+
+	var missing = []
+	for kind in EXPECTED_KINDS:
+		if not seen.has(kind):
+			missing.push_back(kind)
+	missing.sort()
+
+	coop_log.info(config.log_name, "census: %s of %s kinds on the wire, %s never ran" % [
+		String(EXPECTED_KINDS.size() - missing.size()), String(EXPECTED_KINDS.size()),
+		String(missing.size())
+	])
+	if missing.size() > 0:
+		coop_log.warning(config.log_name, "census: never ran: %s" % [join(missing, " ")])
+
+
 func __report_state():
 	var started = OS.get_ticks_msec()
 	var state = models.get_data()
 	var json = state.to_json()
-
 	coop_log.write_text(config.log_name + "-state.json", json)
 	coop_log.info(config.log_name, "report: state is %s models, %s bytes (%s ms to serialise)" % [
 		String(state.size()), String(json.length()), String(OS.get_ticks_msec() - started)
@@ -4826,10 +4998,6 @@ func __evaluate_difftest():
 # equals the live state. Reports what the stream costs: bytes, gzipped bytes, and how long an
 # update takes.
 # ---------------------------------------------------------------------------
-func __cost_descending(a, b):
-	return a.ms > b.ms
-
-
 func __run_streamtest():
 	if __step < 5:
 		return

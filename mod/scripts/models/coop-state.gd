@@ -67,10 +67,6 @@ func is_settled(offer_id):
 	return _settled.has(String(offer_id))
 
 
-func get_players():
-	return _players
-
-
 func has_player(player_id):
 	return _players.has(String(player_id))
 
