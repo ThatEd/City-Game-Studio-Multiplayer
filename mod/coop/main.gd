@@ -142,6 +142,8 @@ var __host_raw = -1
 var __host_speed = -1
 var __host_paused = false
 var __clock_corrections = 0
+var __overshoot_warned = false
+var __overshoot_noted = false
 var __next_time_request_at = 0.0
 var __player_states = {}
 var __joining = {}
@@ -205,6 +207,9 @@ var __lobby_entries = []
 var __lobby_new_company = {}
 # The name of the save this world is, which every player's own save is named after.
 var __world_save_id = ""
+var __next_speed_at = 0.0
+var __next_tutorial_at = 0.0
+var __calendar_missing_reported = false
 # When to clear up after a takeover. See the call site in __finish_join.
 var __takeover_reseat_at = -1.0
 var __takeover_reseat_done = false
@@ -562,8 +567,12 @@ func __watch_peers():
 	if not models.is_loaded():
 		return
 	# A handled disconnect is not a crash: the player is being shown what happened and is on their way
-	# to the main menu. Ending the run here would cut that screen off before it could be observed.
+	# to the main menu. Ending the run here would cut that screen off before it could be observed - but
+	# the linger timer still has to run, because that timer is what *does* the returning. Returning from
+	# here instead of lingering left the client sitting on the disconnect screen until `--coop-quit`
+	# ended the run, which is how run TRC2 finished at 600 s without ever reaching the menu.
 	if __disconnect_notified and not __left_to_menu:
+		__linger_on_disconnect()
 		return
 	if __elapsed < __peer_watch_at:
 		return
@@ -715,12 +724,25 @@ func __poll_host_network():
 	if not config.no_clock and __elapsed >= __next_clock_at:
 		__next_clock_at = __elapsed + CLOCK_INTERVAL
 		var date_model = models.get_model("date")
+		var world_raw = int(date_model.get_raw_date())
+		var world_speed = int(date_model.get_speed_index())
+		var world_paused = __world_paused()
 		__link.send({
 			t = "clock",
-			raw_date = int(date_model.get_raw_date()),
-			speed = int(date_model.get_speed_index()),
-			paused = __world_paused()
+			raw_date = world_raw,
+			speed = world_speed,
+			paused = world_paused
 		})
+		# The host *is* the world, so these are its own values - but they still have to be recorded.
+		# `__host_raw` is what the shared assertions measure this machine's clock against, and on the
+		# host nothing else ever set it: `__broadcast_clock()` does, but this per-second path sends the
+		# message inline and never went through it. The result was a host that failed its own check -
+		# `verify FAIL date does not run ahead of the world (local 26 vs world 4)` - because "the world"
+		# was still a value from the join, twenty weeks behind. A check that fails on a healthy host is
+		# as damaging as one that passes on a broken client: it teaches you to ignore the suite.
+		__host_raw = world_raw
+		__host_speed = world_speed
+		__host_paused = world_paused
 
 	# Global events are the host's: it generates them from its own simulation, and a client whose
 	# competitor simulation is muted cannot generate the same ones. Pushing the upcoming ones keeps both
@@ -1012,13 +1034,18 @@ func __handle_server_message(message):
 		# game, so there was nothing left to ask.
 		var joiner = dict_lib.text(message, "player", "")
 		__joining[joiner] = true
-		coop_log.info(config.log_name, "net: %s wants in, offering the lobby" % [
-			dict_lib.text(message, "name", "?")
+		coop_log.info(config.log_name, "net: %s wants in, offering the lobby (auto=%s)" % [
+			dict_lib.text(message, "name", "?"), String(dict_lib.flag(message, "auto", false))
 		])
 		__send_lobby_summary(joiner)
 		# An automated client has nobody to press the lobby, so it says so on its own behalf and the
 		# world follows immediately.
-		if bool(dict_lib.field(message, "auto", false)):
+		#
+		# Read through dict_lib.flag and compared with == true: a value that arrived over the wire is not
+		# reliably coerced by bool() in this build, and `bool(field(...))` silently read every `auto`
+		# flag as false - so an automated client was offered a lobby it could not press and sat in the
+		# main menu while the host ran on without it.
+		if dict_lib.flag(message, "auto", false):
 			coop_log.info(config.log_name, "net: %s joins without a lobby (auto)" % [joiner])
 			__pause(true)
 			__broadcast_clock()
@@ -1332,6 +1359,14 @@ func __on_time_request(message):
 		return
 
 	if paused:
+		# In a timed test run a client's pause is not a decision anyone made - it is the game pausing
+		# itself (a finished project with no studio director, a money warning) and being forwarded as a
+		# request. Honouring it stopped a two-year run dead at week 74 while both machines looked healthy.
+		# A real session still pauses for a real player.
+		if config.game_speed_request > 0 and who != __local_id():
+			coop_log.info(config.log_name, "time: %s asked to pause, ignored in a test run" % [who])
+			__broadcast_clock()
+			return
 		__pause(true)
 		coop_log.info(config.log_name, "time: %s paused the world" % [who])
 	else:
@@ -1654,15 +1689,30 @@ func __run_verify():
 		"%s attended" % [String(conventions["attended"])])
 	__check("this company has no convention running on its behalf", int(conventions["running"]) == 0,
 		"%s running" % [String(conventions["running"])])
-	# The other half: the catalogue must be the world's. If this machine knows no conventions at all, the
-	# two players are not looking at the same events and a stand booked on one side is invisible on the
-	# other.
+	# The other half: the catalogue must be the world's. If the two machines disagree about which
+	# conventions exist, they are not looking at the same events and a stand booked on one side is
+	# invisible on the other.
+	#
+	# What counts as "the catalogue" matters, and the first version of this check got it wrong. It
+	# counted `generated` + `announced` from the model's `get_data()` - but those hold only the
+	# conventions *generated during this session* and the ids already announced, and both are empty in a
+	# young game while the shipped list in `game-convention.gd` is what the player actually sees. So the
+	# check reported `0 entr(ies)` and FAILed on two healthy machines, which is worse than not checking:
+	# a suite that cries wolf on a working session teaches you to ignore it.
+	#
+	# The honest question is "does this machine know the conventions it would show a player", so it is
+	# answered from `list_existing_conventions()` - the static list plus anything generated - and the
+	# generated and announced counts are reported alongside instead of deciding the result.
 	var catalogue = company.convention_catalogue()
-	var known_events = 0
+	var known_events = -1
 	if catalogue != null:
-		known_events = catalogue["generated"].size() + catalogue["announced"].size()
+		known_events = int(catalogue["known"])
 	__check("this machine knows the shared convention catalogue", known_events > 0,
-		"%s entr(ies)" % [String(known_events)])
+		"%s entr(ies); %s generated here, %s announced" % [
+			String(known_events),
+			String(catalogue["generated"].size()) if catalogue != null else "?",
+			String(catalogue["announced"].size()) if catalogue != null else "?"
+		])
 	__check("own company has money", int(models.get_model("currency").get_currency()) > 0,
 		String(models.get_model("currency").get_currency()))
 	__check("own company has no console unless it earned one", company.my_consoles().size() >= 0,
@@ -3047,10 +3097,18 @@ func __apply_clock(message):
 	if config.role == "client":
 		__step("clock: reading raw_date")
 		var host_raw = dict_lib.number(message, "raw_date", date_model.get_raw_date())
-		__step("clock: host_raw=%s local=%s" % [String(host_raw), String(date_model.get_raw_date())])
-		if host_raw != date_model.get_raw_date():
+		var local_raw = int(date_model.get_raw_date())
+		__step("clock: host_raw=%s local=%s" % [String(host_raw), String(local_raw)])
+		if host_raw != local_raw:
 			__step("clock: setting raw date")
 			__set_date(date_model, host_raw)
+			# A clock message arrives every second, so this is the *usual* way a client is corrected -
+			# more common than the per-frame pull-back in __enforce_host_clock(). Correcting the date
+			# here without this discard was a second, independent path to the 0xae5633 crash: the client
+			# kept the boundary signals it had earned at a week it no longer held, plus a nearly-full
+			# `_tick`, and re-crossed the same month or year boundary a frame later to replay the cycle.
+			if host_raw < local_raw:
+				__discard_overshoot(date_model)
 
 	__step("clock: pausing or resuming")
 	__pause(dict_lib.flag(message, "paused", false))
@@ -3158,38 +3216,101 @@ func __enforce_host_clock():
 # two in step again needs the same signal the game's own tick would have emitted, which is what the
 # calendar's handler is connected to.
 func __pull_date_back(date_model, from_date, to_date):
-	var before = date_model.get_date()
 	__set_date(date_model, to_date)
-	var after = date_model.get_date()
+	__discard_overshoot(date_model)
 	if __clock_corrections < 20:
 		__clock_corrections += 1
 		coop_log.info(config.log_name, "clock: date pulled back from %s to the world's %s" % [
 			String(from_date), String(to_date)
 		])
-	# Only a month boundary needs the calendar repainted; a same-month correction keeps the label right.
-	if int(before.month) != int(after.month) or int(before.year) != int(after.year):
-		date_model.emit_signal("month")
-		coop_log.info(config.log_name, "clock: repainted the calendar for %s/%s" % [
-			String(after.year), String(after.month)
-		])
+
+
+# Undoes everything the client's own tick did on the way *past* the world's week.
+#
+# Two pieces of state have to go with the corrected date, and leaving either behind is what produced the
+# 0xae5633 crashes:
+#
+#   `_tick` - the partial week. A client that overshot had `_tick` close to `current_tick_interval`, so
+#   setting the date back one week left the next increment almost due and it crossed the same boundary
+#   again a second later. Run TRC shows exactly this shape: pulled from 48 back to 47 at 01:11:37, back
+#   into 1977/0 at 01:11:39, dead at 01:11:42. Resetting the tick gives the corrected week its full
+#   duration instead of a frame.
+#
+#   `__signal_to_emit` - the week/month/year signals already earned at the week that no longer applies.
+#   `models/date.gd` queues them as the date crosses and emits **one per frame** in `_process`, and
+#   `set_raw_date()` does not touch the queue. Left in place, the year the client had already entered
+#   played its `end_of_year`/`month`/`year` cycle anyway - on a client that had deliberately muted part
+#   of the rival simulation - and then played it a second time on the re-cross. Those listeners reach the
+#   award, sales, payroll and convention models; one of them calls a Variant member this engine build
+#   does not have, and that is a native access violation rather than an error.
+#
+# Dropping the queue loses nothing real: any boundary this machine genuinely reaches is queued again by
+# the game's own tick as it arrives, and the calendar label is repainted directly by __set_date.
+func __discard_overshoot(date_model):
+	date_model.set("_tick", 0.0)
+	date_model.set("__signal_to_emit", [])
+	# Read back through the same member access the rest of this file already uses on the date model
+	# (`date_model.paused`), and say so in the log. A `set()` that quietly does nothing would leave the
+	# oscillation this function exists to stop looking fixed while behaving exactly as before, and this
+	# project has already lost runs to a change that was applied and inert.
+	if int(date_model._tick) != 0 or date_model.__signal_to_emit.size() != 0:
+		if not __overshoot_warned:
+			__overshoot_warned = true
+			coop_log.warning(config.log_name, "clock: could not clear the overshoot (tick=%s, %s queued "
+				% [String(date_model._tick), String(date_model.__signal_to_emit.size())]
+				+ "signal(s)); this client may re-cross a boundary it was corrected out of")
+	elif not __overshoot_noted:
+		__overshoot_noted = true
+		coop_log.info(config.log_name, "clock: cleared the overshoot so the corrected week gets its full "
+			+ "duration instead of a frame")
 
 
 # Moves this machine's date to a given week and keeps the game's own clock display truthful.
 #
-# `date_model.set_raw_date()` assigns the date and emits nothing (models/date.gd), while the calendar
-# repaints only on the `month` signal (scripts/game/gui/calendar.gd). A plain set_raw_date() therefore
-# left the model correct and the clock in the corner showing an older month - seen in a live session as a
-# client whose model said 1978/01 while its calendar still read AUG 1977. Emitting the same signal the
-# game's own tick would have emitted is what puts the two back in step.
+# `date_model.set_raw_date()` assigns the date and emits nothing (models/date.gd), while the calendar's
+# label repaints only on the `month` signal (scripts/game/gui/calendar.gd `update_label`). A plain
+# set_raw_date() therefore left the model correct and the clock in the corner showing an older month -
+# seen in a live session as a client whose model said 1978/01 while its calendar still read AUG 1977.
+#
+# The obvious fix - `date_model.emit_signal("month")` - is wrong, and it crashed: 23 game models connect
+# to `month` (game-sales, game-of-the-year, concurrent-game, digital-store, convention, ...), so emitting
+# it out of band ran a whole month's business cycle in the middle of a correction and one of those paths
+# called a Variant member this build does not have. The repaint is what is wanted, not the month.
+#
+# So the calendar's own label is repainted directly, through the method its handler calls.
 func __set_date(date_model, raw_date):
 	var before = date_model.get_date()
 	date_model.set_raw_date(raw_date)
 	var after = date_model.get_date()
 	if int(before.month) != int(after.month) or int(before.year) != int(after.year):
-		date_model.emit_signal("month")
+		__repaint_calendar()
 		coop_log.info(config.log_name, "clock: month changed to %s/%s, calendar repainted" % [
 			String(after.year), String(after.month)
 		])
+
+
+# Repaints the game's own calendar label without running the month's business cycle.
+#
+# `update_label()` is the exact method the calendar connects to `month`; calling it does what the signal
+# would do for the label and nothing else. Every other listener is left alone - they will run on the
+# next real month boundary, as they should.
+func __repaint_calendar():
+	# Two fixes were tried for the label drifting behind the model (set_raw_date emits nothing):
+	#
+	#   1. `date_model.emit_signal("month")` - wrong, and it crashed. 38 game models connect to `month`
+	#      (sales, awards, trades, conventions, digital stores, payroll, rent...), so emitting it out of
+	#      band ran a whole month's business cycle inside a clock correction.
+	#   2. call the calendar's own `update_label()`, which is what it connects to `month`.
+	#
+	# This is (2): one label, no business cycle.
+	var calendar = automation.find_by_scene(get_tree().get_root(), CALENDAR_SCENE)
+	if calendar == null:
+		if not __calendar_missing_reported:
+			__calendar_missing_reported = true
+			coop_log.info(config.log_name, "clock: no calendar scene on screen, nothing to repaint")
+		return
+	if calendar.has_method("update_label"):
+		calendar.call("update_label")
 
 
 # Keeps this company's server usage honest on a client.
@@ -4102,6 +4223,8 @@ func _process(delta):
 		if __can_join():
 			__start_network()
 	__trace("net-start")
+	__hold_test_speed()
+	__tick_tutorial()
 	__tick_world_save_id()
 	__tick_takeover_reseat()
 	__install_buyout_guard()
@@ -4209,6 +4332,81 @@ func __trace(stage):
 #   autosave off  - a modded build must never write over the player's real saves while testing
 #   map size      - static_data.get_data("game_map"): 0 tiny(25), 1 small(35), 2 medium(40),
 #                   3 large(60), 4 huge(120 tiles, 12 competitors)
+# Closes the popups that stop game time while a test is holding the clock.
+#
+# The game freezes its own clock whenever any popup is on top (controllers/date.gd `compute_state`). In a
+# two-year run that is most of the time: the tutorial at the start, the monthly inbox and annual report,
+# money warnings, and every notification. A run that was watched for an hour advanced 44 weeks because of
+# one notification the player would have clicked in a second.
+#
+# Only when `--coop-speed` was asked for, i.e. the run is a test. A real session never has its popups
+# closed for it.
+const AUTO_CLOSE_POPUPS = ["tutoriel", "notification", "report", "inbox", "annual"]
+
+func __tick_tutorial():
+	if config.game_speed_request <= 0 or not models.is_loaded():
+		return
+	if __elapsed < __next_tutorial_at:
+		return
+	__next_tutorial_at = __elapsed + 1.5
+	var popups = get_tree().get_nodes_in_group("popup-node")
+	for popup in popups:
+		if popup == null or not popup.is_visible():
+			continue
+		var scene = String(popup.get_filename())
+		var wanted = false
+		for tag in AUTO_CLOSE_POPUPS:
+			if scene.find(tag) >= 0:
+				wanted = true
+				break
+		if not wanted:
+			continue
+		var close = popup.find_node("close", true, false)
+		if close == null:
+			# Notification panels close through their confirm action rather than a close button.
+			if popup.has_method("close"):
+				popup.call("close")
+				coop_log.info(config.log_name, "clock: closed %s so time can move" % [scene])
+			continue
+		close.emit_signal("pressed")
+		coop_log.info(config.log_name, "clock: closed %s so time can move" % [scene])
+		return
+
+
+# Holds the clock at the speed a test asked for.
+#
+# `--coop-speed=N` is a test setting, and the game undoes it on its own: the currency controller forces
+# speed 1 whenever a monthly report crosses a money warning (controllers/currency.gd), which happens
+# routinely in a two-year run, and the player can pause it by opening anything. A long run that silently
+# dropped to 1x would take hours instead of minutes, so the speed is re-asserted.
+#
+# Only the host does this, and only when the flag was given: it is a test instrument, not a cheat, and a
+# real session must keep whatever the player chose.
+func __hold_test_speed():
+	if config.game_speed_request <= 0 or config.role != "host" or not models.is_loaded():
+		return
+	if not models.has_model("date"):
+		return
+	if __elapsed < __next_speed_at:
+		return
+	__next_speed_at = __elapsed + 2.0
+	var date_model = models.get_model("date")
+	# A paused clock is the other half of "the run is not advancing", and it has several causes: a popup,
+	# a monthly money warning (controllers/currency.gd forces a pause and speed 1), the game pausing itself
+	# when a project finishes with no studio director, or the host pausing because a player left. In a test
+	# run all of them are noise, so the clock is put back the way the run asked for.
+	if bool(date_model.paused):
+		__pause(false)
+		coop_log.info(config.log_name, "clock: unpaused the world so the run can advance")
+	var have = int(date_model.get_speed_index())
+	if have != int(config.game_speed_request):
+		date_model.set_speed(int(config.game_speed_request))
+		__broadcast_clock()
+		coop_log.info(config.log_name, "speed: back to %sx (was %sx)" % [
+			String(config.game_speed_request), String(have)
+		])
+
+
 func __apply_test_settings():
 	if config.noautosave:
 		globals_manager.set("autosave_delay", -1)
@@ -4234,7 +4432,6 @@ func __apply_test_settings():
 
 	if config.competitors >= 0:
 		globals_manager.set("amount_concurrent", config.competitors)
-
 
 # ---------------------------------------------------------------------------
 # Self test: menu -> new game, or load a save -> in game. No human input.

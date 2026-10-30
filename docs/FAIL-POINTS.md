@@ -58,6 +58,7 @@ runs. It calls `reload(true)` and treats 22 as success. A check that cries wolf 
 | A correction that does not repaint | **proven, fixed.** `set_raw_date()` emits nothing; the HUD paints on `month`. A live session showed a client whose model said 1978/01 and whose clock read AUG 1977 |
 | A frozen clock that is not a bug | **proven.** `controllers/date.gd compute_state` freezes unless the game's main scene is on top. Any popup stops time. Two long sessions reached several in-game years once the popups were closed |
 | Speed / pause disagreement | **proven.** Speed and paused travel with the clock; a mismatch is logged and reconciled |
+| A client that overshoots and is rewound | **proven, fixed.** This was the long-standing `0xae5633` client crash. `models/date.gd` queues `end_of_week`/`new_week`/`month`/`year` as the date crosses and emits one per frame; `set_raw_date()` leaves that queue and `_tick` alone. A client pulled back one week therefore re-played the month (or the year) it had already entered, on a machine that had deliberately muted part of the rival simulation - and one of those listeners calls a Variant member this build lacks. Run TRC shows the shape: pulled 48→47, back into 1977/0 two seconds later, dead at `0xae5633`. `__discard_overshoot()` now zeroes `_tick` and clears the queue on every correction. Verified: a 600 s run then passed 1976→1981 with both machines alive |
 
 ## 5. The company split
 

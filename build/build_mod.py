@@ -331,6 +331,7 @@ def check_missing_classes(files):
     problems.extend(_check_missing_operators(files))
     problems.extend(_check_missing_methods(files))
     problems.extend(_check_structure(files))
+    problems.extend(check_date_rewind(files))
     return problems
 
 
@@ -400,6 +401,10 @@ _BAD_CONSTRUCTS = (
      "This mod builds its nodes in code."),
     (re.compile(r"\bsignal\s+\w+\("), "signal declarations with parentheses do not exist in Godot 2",
      "This mod connects to the game's own signals."),
+    (re.compile(r"^\s*match\s+\S"), "`match` does not exist in Godot 2.1",
+     "Use if/elif on typeof()."),
+    (re.compile(r"\bfunc\s+\w+\([^)]*\)\s*->"), "return-type annotations do not exist in Godot 2",
+     "Leave the type off."),
 )
 
 
@@ -455,7 +460,114 @@ def _check_missing_methods(files):
                         f"{name}:{number}: {method}() does not exist in this build; calling it is a "
                         "runtime error or a crash, not something that can be caught"
                     )
+            # Emitting a *model's* signal runs every listener the game registered on it. `month` alone has
+            # 23 - sales, awards, trades, conventions, digital stores - so emitting it out of band ran a
+            # whole month's business cycle inside a clock correction and crashed on a Variant this build
+            # lacks. A model signal is the game's to emit; the mod calls the one handler it wants instead.
+            if _is_game_signal_emit(code):
+                problems.append(
+                    f"{name}:{number}: this emits a signal on a game model, which runs every listener the "
+                    "game registered on it; call the single handler you need instead"
+                )
     return problems
+
+
+# Signals a game model owns, that the mod must never emit.
+_GAME_SIGNALS = (
+    "month", "year", "end_of_week", "end_of_month", "end_of_year", "new_week",
+    "before_end_of_month", "first_week_of_the_month", "monthly_report_reset",
+    "start_game", "speed_changed", "freeze", "unfreeze", "update_season",
+)
+
+
+def _is_game_signal_emit(code):
+    if "emit_signal" not in code:
+        return False
+    for signal_name in _GAME_SIGNALS:
+        if f'emit_signal("{signal_name}")' in code:
+            return True
+    return False
+
+
+def check_date_rewind(files):
+    """Refuse a date correction that does not also discard the week the machine overshot.
+
+    This is the guard for the `0xae5633` client crash, the longest-lived bug in this project. The game's
+    date model queues week/month/year signals as the date crosses them and emits one per frame; it also
+    keeps `_tick`, the progress through the current week. `set_raw_date()` touches neither.
+
+    So a client pulled back a week kept the boundary signals it had already earned *and* a nearly-full
+    `_tick`, crossed the same boundary again a frame later, and replayed a month or year cycle - on a
+    machine that had deliberately muted part of the rival simulation. One of those listeners calls a
+    Variant member this engine build lacks, which is a native access violation with no traceback.
+
+    Any call that moves the date backwards must be paired with a discard. The pairing is checked by
+    requiring `set_raw_date(` and the discard to appear in the same file, and by requiring the discard
+    to be called from every function that rewinds. A guard that cannot fail is worse than none, so
+    build_run_tests.py proves this one catches a rewind with no discard.
+    """
+    discard = "__discard_overshoot"
+    problems = []
+    for name, data in sorted(files.items()):
+        if not name.endswith(".gd"):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if "set_raw_date(" not in text:
+            continue
+        if discard not in text:
+            problems.append(
+                f"{name}: calls set_raw_date() but never calls {discard}(); a rewound date keeps the "
+                "stale boundary signals and the overshot _tick, which re-plays a month or year cycle "
+                "and crashes at 0xae5633"
+            )
+            continue
+        # Every function that rewinds has to discard, not just the file as a whole: the discard being
+        # defined somewhere is exactly the shape of the change that looked applied and did nothing.
+        lines = text.splitlines()
+        current = ""
+        rewinds = []
+        discards = set()
+        for index, line in enumerate(lines):
+            code = line.split("#", 1)[0]
+            header = re.match(r"^func (\w+)\s*\(", code)
+            if header:
+                current = header.group(1)
+                continue
+            if "set_raw_date(" in code and _moves_date_back(code):
+                rewinds.append((current, index + 1))
+            if discard + "(" in code:
+                discards.add(current)
+        for func, number in rewinds:
+            if func in (discard, "__set_date"):
+                # __set_date is the primitive; the guarantee lives in its callers.
+                continue
+            if func not in discards:
+                problems.append(
+                    f"{name}:{number}: {func}() rewinds the date without calling {discard}(); the "
+                    "stale boundary signals will replay a month or year cycle (0xae5633)"
+                )
+    return problems
+
+
+def _moves_date_back(code):
+    """Whether this statement sets the date to something that can be *older* than it is now.
+
+    Only a backwards move is dangerous: crossing a boundary on the way back and then crossing it again
+    re-plays the cycle. A test that deliberately pushes the date forward (`+ 10`) is doing the opposite
+    harm and needs no discard, and flagging it would be a false positive - which is how a guard gets
+    switched off.
+
+    Anything that is not obviously an increment is treated as a rewind, because the dangerous form is
+    `set_raw_date(<some value>)` where the value is the world's, and that is the one that must be paired.
+    """
+    inner = code.split("set_raw_date(", 1)[1]
+    # `get_raw_date() + N` / `get_raw_date() + delta` only ever moves forward.
+    if re.search(r"get_raw_date\(\)\s*\+\s*[A-Za-z0-9_]", inner):
+        return False
+    return True
 
 
 def check_native_killers(files):

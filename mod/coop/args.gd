@@ -77,6 +77,7 @@ static func parse(args):
 		noautosave = false,
 		map_size = -1,
 		game_speed = -1,
+		game_speed_request = 0,
 		difficulty = -1,
 		competitors = -1,
 		quit_after = -1.0,
@@ -258,6 +259,11 @@ static func parse(args):
 			result.map_size = int(value)
 
 		elif flag == "--coop-speed":
+			# The clock speed the test wants held (1/2/4/6). Not the same as the game's weeks-per-month
+			# setting, which is what --coop-weeks does.
+			result.game_speed_request = int(value)
+
+		elif flag == "--coop-weeks":
 			result.game_speed = int(value)
 
 		elif flag == "--coop-difficulty":

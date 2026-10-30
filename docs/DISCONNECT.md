@@ -31,6 +31,33 @@ expired**. It would have printed the same thing onto a blank screen. It now look
 up and says so only once it is found. This is the difference between a working flow and a working
 intention.
 
+### The return was dead code once
+
+Between the screen appearing and the return is a linger timer, so a player reads the message before the
+menu replaces it. `__watch_peers()` used to `return` as soon as `__disconnect_notified` was set - which
+is set at the same moment as the screen - so the timer that does the returning never ran. The client sat
+on the disconnect screen until `--coop-quit` ended the run. Run TRC2 finished at 600 s with this in the
+log and no menu line at all:
+
+```
+WARN net: the relay says the host has left the session
+INFO net: company written in 5247 ms as coop-Highland-tester
+INFO net: company handed to the relay on the way out
+INFO quit after 600 s (test mode)          <- never reached the menu
+```
+
+Found by reading the log of a run that had otherwise passed. `__watch_peers()` now calls
+`__linger_on_disconnect()` on that path instead of returning, and the same test afterwards reads:
+
+```
+WARN net: the relay says the host has left the session
+INFO net: company written in 5279 ms as coop-Highland-tester
+INFO net: company handed to the relay on the way out
+WARN test: disconnect screen held 20 s, returning to the menu
+INFO net: returning to the main menu after the host left
+INFO test: main menu is up, ending this run
+```
+
 ## Where the save goes
 
 Two copies, on purpose:

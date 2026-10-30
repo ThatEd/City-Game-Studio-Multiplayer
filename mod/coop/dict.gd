@@ -37,4 +37,19 @@ static func flag(source, key, fallback):
 	var value = field(source, key, null)
 	if value == null:
 		return fallback
-	return bool(value)
+	# A value that arrived over the wire is not reliably coerced by bool() in this build: a JSON `true`
+	# came back as a String and bool() read it as false, which silently turned every "auto" join into a
+	# lobby the client could not press. Handled by type instead of trusting the cast.
+	#
+	# if/elif on typeof, not a `match` statement: Godot 2.1 has no match, and writing one is a parse error
+	# that silently keeps the file's previous version - which is exactly how the first attempt at this fix
+	# looked applied while doing nothing.
+	var kind = typeof(value)
+	if kind == TYPE_BOOL:
+		return value
+	if kind == TYPE_INT or kind == TYPE_REAL:
+		return int(value) != 0
+	if kind == TYPE_STRING:
+		var text = String(value).strip_edges().to_lower()
+		return text == "true" or text == "1" or text == "yes"
+	return false

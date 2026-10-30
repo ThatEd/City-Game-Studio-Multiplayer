@@ -332,7 +332,16 @@ class Server:
             if stored is not None:
                 self.log(f"replaying the stored company for {client.player_id}")
                 self.send(client, {"t": "company", "company": stored})
-            self.send(host, {"t": "join_request", "player": client.player_id, "name": client.name})
+            self.send(host, {
+                "t": "join_request",
+                "player": client.player_id,
+                "name": client.name,
+                # Forwarded, not invented: the client decides whether it can show a lobby, and the host
+                # acts on that answer. Dropping it here made every automated join look like an
+                # interactive one, so the host offered a lobby nobody could press and the client sat in
+                # the main menu while the host's clock ran on.
+                "auto": bool(message.get("auto", False)),
+            })
             if host.world is not None:
                 self.log("replaying the cached world to the joiner")
                 self.send(client, host.world)

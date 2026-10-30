@@ -126,6 +126,34 @@ def test_join_request_tells_the_host(server, port):
     client.close()
 
 
+def test_the_auto_flag_reaches_the_host(server, port):
+    """A client that cannot show a lobby says so, and the host must hear it.
+
+    The relay used to rebuild the join_request with only player and name, dropping `auto`. Every
+    automated join then looked interactive, so the host offered a lobby nobody could press and the client
+    sat in the main menu while the host's clock ran on - which looks exactly like a broken lobby.
+    """
+    host = Client(port)
+    host.send({"t": "role", "role": "host", "player": "h", "name": "hosty"})
+    client = Client(port)
+    client.send({"t": "role", "role": "client", "player": "c1", "name": "one"})
+    client.send({"t": "join_request", "player": "c1", "auto": True})
+
+    requests = [m for m in host.drain(1.0) if m["t"] == "join_request"]
+    assert requests, "the host heard no join request at all"
+    assert requests[0].get("auto") is True, (
+        "the auto flag was dropped on the way to the host: %s" % requests[0]
+    )
+
+    # And a manual join must not be turned into an automatic one.
+    client.send({"t": "join_request", "player": "c1", "auto": False})
+    later = [m for m in host.drain(1.0) if m["t"] == "join_request"]
+    assert later and later[-1].get("auto") is False, later
+
+    host.close()
+    client.close()
+
+
 def test_clock_is_broadcast_to_every_client(server, port):
     host = Client(port)
     host.send({"t": "role", "role": "host", "player": "h", "name": "hosty"})
@@ -385,6 +413,7 @@ def test_slow_reader_is_not_dropped(server, port):
 TESTS = [
     ("world reaches the joiner, also later", test_world_reaches_the_joiner),
     ("join request reaches the host", test_join_request_tells_the_host),
+    ("the auto flag reaches the host", test_the_auto_flag_reaches_the_host),
     ("clock is broadcast to every client", test_clock_is_broadcast_to_every_client),
     ("client company reaches the host and is kept", test_client_company_goes_to_the_host_and_is_kept),
     ("host company table fans out", test_host_company_table_fans_out),

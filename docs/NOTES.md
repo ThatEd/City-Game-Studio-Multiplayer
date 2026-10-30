@@ -1585,3 +1585,297 @@ that 200 MB of history had hidden.
   node is still processing. It fires on the way back to the menu whether the mod is involved or not, so
   it is engine/game behaviour and is recorded rather than patched - patching the game's own script is a
   bigger step than this pass warrants for a message that does not crash.
+
+
+## Pass 22 - the 0xae5633 client crash, found from the machine code
+
+Four runs had died at `0xae5633` and every attempt to fix it had been a guess about which GDScript call
+was at fault. This pass stopped guessing and read the instruction.
+
+### Naming the fault
+
+The fault offset is a fixed, known quantity, so it can be disassembled directly instead of being
+theorised about:
+
+```python
+pe   = pefile.PE(exe); img = pe.OPTIONAL_HEADER.ImageBase
+off  = pe.get_offset_from_rva(0xae5633)
+md   = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+# ... disassemble data[off-0x300:off+0x30] at img + 0xae5633 - 0x300
+```
+
+```
+140ae562a  xor  edi, edi
+140ae562c  cmp  rax, r8
+140ae562f  cmovne rdi, rax
+140ae5633  cmp  esi, dword ptr [rdi + 0x38]    <== FAULT
+```
+
+`rdi` is the result of a lookup that came back empty, and the very next use dereferences it. The
+strings sitting beside that code name the function:
+
+```
+r9  -> "on ' p_argcount > 5 ' is true."
+rdx -> "core\variant_call.cpp"
+rcx -> "_VariantCall::FuncData::call"
+```
+
+So the signature is not "a bad pointer somewhere in the game" - it is **this build's `_VariantCall`
+dereferencing a null `FuncData` when a member does not exist**. That is the same crash
+`Dictionary.get()` produces, which is why `check_native_killers()` had always been able to reproduce it:
+any missing Variant member lands here. The question was never *whether* it was a missing member, only
+*which one*, and the answer had to come from the log rather than from the offset.
+
+### What the log said
+
+The client's last four lines in run TRC:
+
+```
+[01:11:37] clock: month changed to 1976/11, calendar repainted
+[01:11:37] clock: date pulled back from 48 to the world's 47
+[01:11:39] clock: month changed to 1977/0, calendar repainted     <- crossed into the new year
+[01:11:42]  (process dies, 0xc0000005 at 0xae5633)
+```
+
+`raw_date 48` is 1977 month 0. So the client had entered the new year, been rewound to week 47, and then
+entered the new year **a second time** two seconds later.
+
+### The mechanism
+
+`models/date.gd` does not emit a boundary when it happens. When `_raw_date` crosses into a new week it
+pushes the names onto a queue and `_process` emits them **one per frame**:
+
+```gdscript
+__signal_to_emit.push_back("end_of_week")
+if _date.week == 0:
+        __signal_to_emit.push_back("end_of_month")
+__signal_to_emit.push_back("new_week")
+if _date.week == 0:
+        __signal_to_emit.push_back("month")
+        if _date.month == 0:
+                __signal_to_emit.push_back("year")
+```
+
+`set_raw_date()` assigns the date and `compute_date()`, and touches neither `_tick` nor that queue. So a
+client that was pulled back one week kept:
+
+- the boundary signals it had already earned at the week it no longer held, and
+- a `_tick` almost equal to `current_tick_interval`, so it re-crossed that boundary a frame later.
+
+January is the expensive case: `end_of_year`, `month` and `year` together reach 38 listeners across the
+award, sales, payroll, convention, digital-store and concurrent models. Replaying that cycle on a
+*client* - a machine that has deliberately disconnected 12 of those listeners so it does not run a
+second rival simulation - reaches one of the paths that calls a Variant member this build lacks.
+
+That also explains why the client and not the host: only the client is ever rewound.
+
+### The fix
+
+`__discard_overshoot()` runs on every correction and zeroes both halves:
+
+```gdscript
+date_model.set("_tick", 0.0)
+date_model.set("__signal_to_emit", [])
+```
+
+and then **reads them back** and logs whether it worked. Nearly every expensive bug in this project has
+been a change that was applied and inert, so a `set()` whose effect is never checked is exactly the
+shape of the next one. A failed clear is a warning; a successful one is a single info line.
+
+### Verified
+
+600 s at 6x, host + client:
+
+```
+client: 1976/0 -> 1981/0   both processes alive at the end
+```
+
+Before this change the same shape of run died within 6 weeks of gameplay. The client's log now shows the
+correction and the clear together at precisely the week that used to be fatal:
+
+```
+clock: month changed to 1976/0, calendar repainted
+clock: cleared the overshoot so the corrected week gets its full duration instead of a frame
+clock: date pulled back from 4 to the world's 3
+```
+
+## Pass 23 - the two-year run, and two checks that were lying
+
+A 1500 s run on the 120-tile map (12 competitors) at 6x, with `--coop-verify` on both machines.
+
+```
+client  1976/0 -> 1990/8   14 in-game years, both processes alive until the cutoff
+```
+
+So the two-year target is met with a wide margin, on the largest map, with a second player joining
+late. But the run's own verify suite reported `27 passed, 2 failed` on the host, and both failures were
+real:
+
+### 1. `date does not run ahead of the world (local 26 vs world 4)`
+
+On the **host**. The check measures the local date against `__host_raw`, and nothing ever set
+`__host_raw` on the host: `__apply_clock()` does, but the host does not call it - it sends the clock
+inline from `__poll_host_network()` every second and never records its own values. So "the world" was
+still whatever the join left behind, twenty weeks stale, and the host failed its own check.
+
+Fixed by recording the three world values where the host sends them. A suite that fails on a healthy
+machine is as corrosive as one that passes on a broken client - it teaches you to skim the output.
+
+Result: `verify PASS date does not run ahead of the world (local 31 vs world 31)`.
+
+### 2. `this machine knows the shared convention catalogue (0 entr(ies))`
+
+The check counted `generated + announced` from `convention.get_data()`. Those two hold only the
+conventions generated *during this session* and the ids already announced - and both are legitimately
+empty in a young game. The list a player actually sees is `list_existing_conventions()`, the shipped
+catalogue plus anything generated: **126 entries**.
+
+So the check was wrong about what the catalogue is, not about whether it had arrived. It now asks the
+game for the list it would show a player, and reports the generated/announced counts alongside:
+
+```
+verify PASS this machine knows the shared convention catalogue (126 entr(ies); 0 generated here, 0 announced)
+```
+
+Both machines: **29 passed, 0 failed**.
+
+## Pass 24 - the disconnect screen that never left
+
+Run TRC2 passed everything and ended like this:
+
+```
+WARN net: the relay says the host has left the session
+INFO net: company written in 5247 ms as coop-Highland-tester
+INFO net: company handed to the relay on the way out
+INFO quit after 600 s (test mode)          <- never reached the menu
+```
+
+The save and the hand-over were fine. The **return to the main menu never happened**, and it was dead
+code: `__watch_peers()` returns as soon as `__disconnect_notified` is set, and that flag is set at the
+same moment the screen appears - so `__linger_on_disconnect()`, which owns the timer that does the
+returning, was never reached on that path. The client sat on the disconnect screen until the test
+harness ended it.
+
+A twenty-second linger is deliberate (a player needs to read the message), which is exactly why the bug
+looked like patience rather than a fault in a long log.
+
+`__watch_peers()` now calls `__linger_on_disconnect()` there instead of returning:
+
+```
+WARN net: the relay says the host has left the session
+INFO net: company written in 5279 ms as coop-Highland-tester
+INFO net: company handed to the relay on the way out
+WARN test: disconnect screen held 20 s, returning to the menu
+INFO net: returning to the main menu after the host left
+INFO test: main menu is up, ending this run
+```
+
+The hand-over record was checked too - the client's company survives the host's death with the right
+save name and session:
+
+```
+id: coop-tester   name: Long Run Studio
+save: coop-Highland-tester   session: coop-Highland
+offices: 1   layouts: (carried)
+```
+
+### A crash that is not ours
+
+One host died at `0x5111bb` during the disconnect test - an out-of-bounds array read in game code
+(`cmp dword ptr [rcx + 0x24]` after a bounds-check message), immediately after logging
+`company section holds coop-highland(0 offices)`. Three repeats with identical flags did not reproduce
+it, and it is on the host path that this pass did not touch, so it is recorded as an observed
+intermittent fault in the game rather than something introduced here. Worth watching: a company with
+**zero** offices is a state the game's own code iterates over without guarding.
+
+## Pass 25 - a second path to the same crash, found by making the guard honest
+
+The date-rewind guard was written to stop the `0xae5633` crash coming back. Its first version was
+worthless, and finding out why was worth more than the guard.
+
+It matched `set_raw_date(` literally. But the mod almost never calls that: it calls its own
+`__set_date()` wrapper. So the guard reported **clean on the exact code that still had the bug**, and
+when the fix was deliberately removed to prove the guard bites, it still reported clean:
+
+```
+call sites before=2 after=1
+caught: 0                 <- the guard did not notice its own fix being deleted
+```
+
+A guard that passes on a broken tree is worse than no guard, because it certifies the bug. Two changes:
+
+- the guard now matches `__set_date(` as well as the primitive, and the test suite has a case for a
+  caller that uses the wrapper;
+- the build now fails on the *real* source, which is how the second instance was found:
+
+```
+res://coop/main.gd:3103: __apply_clock() moves the date back without calling __discard_overshoot();
+the stale boundary signals will replay a month or year cycle (0xae5633)
+```
+
+### The second path
+
+`__apply_clock()` handles the host's clock message, which arrives **every second**, and corrected a
+drifting client with a bare `__set_date()` - no discard. That is a far more common correction than the
+per-frame pull-back in `__enforce_host_clock()` that had just been fixed, so the original fix had closed
+one door and left the busier one open. A client pulled back across a month boundary by a clock message
+kept the boundary signals and the overshot `_tick` exactly as before, and re-crossed to replay the cycle.
+
+Now, whenever the clock message moves the client *backwards*, it discards too:
+
+```gdscript
+if host_raw != local_raw:
+        __set_date(date_model, host_raw)
+        if host_raw < local_raw:
+                __discard_overshoot(date_model)
+```
+
+Only backwards: a message that moves the client *forward* is the world progressing, and clearing the
+queue there would throw away boundaries the client has legitimately earned.
+
+## Pass 26 - the two-year run, complete
+
+`tools\run-coop.ps1 -Name TWOYR -Port 8975 -Speed 6 -Verify 60 -MapSize 4 -Seconds 960`
+
+| | |
+|---|---|
+| Map | 120 tiles, 12 competitors (the largest) |
+| Speed | 6x, held there |
+| Reached | **1985/3** — eight and a half in-game years, from a 1976 start |
+| Assertions | `verify: 29 passed, 0 failed` on **both** machines |
+| Crashes | none; both processes alive until their own quit timer |
+
+The disconnect path, in full, for the first time in a single run:
+
+```
+05:16:28  quit after 960 s (test mode)                      <- the host stops
+05:16:31  net: the relay says the host has left the session
+05:16:37  net: company written in 5965 ms as coop-Highland-tester
+05:16:37  net: company handed to the relay on the way out
+05:17:07  test: disconnect screen held 20 s, returning to the menu
+05:17:08  net: returning to the main menu after the host left
+05:17:20  test: main menu is up, ending this run
+```
+
+and the player's company survives it, with the save name that lets a host serve it again:
+
+```
+id: coop-tester   name: Long Run Studio
+save: coop-Highland-tester   session: coop-Highland   offices: 1
+```
+
+### The harness bug that hid the disconnect path
+
+The runner gave the host and the client **the same** `--coop-quit`. A run whose two halves stop at the
+same second never exercises the disconnect path: the client is killed at the instant it is told the host
+is gone, mid-save. Run FIN ended like this and looked exactly like the dead-linger bug it had just been
+fixed for:
+
+```
+net: company written in 5281 ms as coop-Highland-tester
+quit after 900 s (test mode)                    <- killed before the screen could finish
+```
+
+`run-coop.ps1` now stops the host first and gives the client `-DisconnectGrace` (90 s) on top, so the
+save, the hand-over, the screen and the return all have room. A test harness that cannot reach the code
+it is meant to test is the same failure as a guard that cannot fail.

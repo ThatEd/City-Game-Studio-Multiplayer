@@ -19,7 +19,7 @@ What that means, split by whether it has actually been seen:
 | | |
 |---|---|
 | **Playable** | A joining player picks who they are in a **lobby** - either the game's own company setup (name, logo, specialisation) or an existing company to take over - and only then is the world sent. Each player's save is stored per session and per player. A host and a client join, boot the same world, and each runs a company. Both appear in each other's rival list by name, with their own money, offices and released games. Time is the host's; a client cannot move it alone. Money, technology and a game's IP can be handed to the other player and both sides agree. When the host leaves, the client is told on screen, saves, and is returned to the main menu. A returning player is handed their company and their office interiors back. |
-| **Only tested by a machine** | Everything above is asserted by an in-game suite (`--coop-verify`) on both machines and by 12 relay cases. What has *not* been looked at by a human is the publish-offer list, the console panel and the map. Release from the UI is **unconfirmed**: the button fires and spends money, but nobody has watched the project leave `HOLD`. |
+| **Only tested by a machine** | Everything above is asserted by an in-game suite (`--coop-verify`) on both machines and by 13 relay cases. The longest run so far went **1976 → 1985 on the 120-tile map at 6x, with 29/29 assertions passing on both machines and neither process dying**. What has *not* been looked at by a human is the publish-offer list, the console panel and the map. Release from the UI is **unconfirmed**: the button fires and spends money, but nobody has watched the project leave `HOLD`. |
 | **Not done** | Split screen. Three or more players at once (the protocol is host-plus-N, but only two have ever run). Rejoining mid-session without a fresh world transfer. Steam invite/friends list — joining is a typed address today. |
 
 There is no installer. It runs from a build folder and is launched with flags, which is the actual
@@ -111,7 +111,7 @@ Nothing below needs a game, except building.
 
 ```bash
 python -I run_all_tests.py              # ALL OK: relay, pack tool, mod compile checks
-python -I server/run_tests.py           # the relay alone, 12 cases
+python -I server/run_tests.py           # the relay alone, 13 cases
 python -I tools/godotpck/run_tests.py   # the pack tool alone
 ```
 
@@ -119,9 +119,12 @@ With the game installed:
 
 ```powershell
 python build\build_mod.py `
-    --install "B:\Steamlibrary\steamapps\common\City Game Studio" `
+    --install "<game dir>" `
     --out .\build\out
 ```
+
+`<game dir>` is the folder holding `CityGameStudio64.exe` and `data.pck` — for a Steam library that is
+`...\steamapps\common\City Game Studio`.
 
 That writes a **complete copy** of the game into `build\out` with the mod injected, and verifies the
 pack's MD5s, the autoload entry and every mod file after writing. The retail install is opened
@@ -146,7 +149,8 @@ Every one of these was paid for with a session that produced nothing.
 |---|---|
 | Adding `TCPServer` to a mod script | It is not in this engine build. Naming a missing class is a **compile error**, and a `.gd` that fails to compile keeps running its *previous* version silently — so the symptom is "my fix did nothing". |
 | `Dictionary.get()`, `Object.get()`, `Array.to_json()`, `Array.extend()` | Also absent. They are `Invalid call` at runtime, or a hard crash inside the engine, not an error you can catch. |
-| A 0xc0000005 with no message | A Variant member that does not exist. The faulting offset `0xae5633` is the member call, not your code. |
+| A 0xc0000005 with no message | A Variant member that does not exist. The faulting offset `0xae5633` is the member call, not your code. Disassemble it: `cmp esi, dword ptr [rdi + 0x38]` inside `_VariantCall::FuncData::call`, where `rdi` is a lookup that came back empty. The offset names the *kind* of fault, never the member — that has to come from the log. |
+| Rewinding the date model | `models/date.gd` queues `end_of_week`/`month`/`year` as the date crosses, and emits one per frame; `set_raw_date()` touches neither the queue nor `_tick`. A client pulled back a week replays that boundary and dies at `0xae5633`. Every backwards move must call `__discard_overshoot()`. `build_mod.py check_date_rewind()` enforces it. |
 | Starting the client first | The client reaches the New Game dialogue and plays its own world. The host must be serving a world before the client starts; `run-coop.ps1` waits for that. |
 | `-WindowStyle Minimized` | Kills the host at ~14 s inside `RichTextLabel::Line`. Not a mod bug. Use a normal window. |
 | A popup is open | The game's clock freezes while any popup is up (`controllers/date.gd`). A stuck date is usually one popup away from moving. |

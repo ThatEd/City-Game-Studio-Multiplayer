@@ -682,8 +682,18 @@ static func record(player_id, slot = null, exclude_games = null, session_save_id
 static func convention_catalogue():
 	if not models.is_loaded() or not models.has_model("convention"):
 		return null
-	var data = models.get_model("convention").get_data()
+	var convention = models.get_model("convention")
+	var data = convention.get_data()
+	var known = 0
+	# The list a player is actually shown: the shipped conventions plus anything generated this session.
+	# Counting only `generated`/`announced` reports 0 in a young game even though the catalogue is fine,
+	# which is what made the shared-catalogue check fail on two healthy machines.
+	if convention.has_method("list_existing_conventions"):
+		var existing = convention.call("list_existing_conventions")
+		if existing != null:
+			known = existing.size()
 	return {
+		known = known,
 		generated = data["generated"] if data.has("generated") else {},
 		announced = data["announced"] if data.has("announced") else {}
 	}

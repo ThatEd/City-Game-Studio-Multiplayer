@@ -86,9 +86,26 @@ MUST_CATCH = [
         "a bare signature stops the whole file loading; this cost two launches",
     ),
     (
+        "match statement",
+        b"func f(v):\n\tmatch typeof(v):\n\t\tTYPE_BOOL:\n\t\t\treturn v\n\treturn false\n",
+        "Godot 2.1 has no match; the parse error silently kept dict.gd's previous version",
+    ),
+    (
+        "emitting a game model signal",
+        b'func f(date_model):\n\tdate_model.emit_signal("month")\n',
+        "runs all 23 listeners of that model signal; it crashed a run inside a clock correction",
+    ),
+    (
         "function defined twice",
         b"func f():\n\treturn 1\n\nfunc f():\n\treturn 2\n",
         "a duplicate definition stops the whole file loading",
+    ),
+    (
+        "a date rewind with no overshoot discard",
+        b"func __pull_date_back(date_model, to_date):\n"
+        b"\tdate_model.set_raw_date(to_date)\n",
+        "the stale boundary signals and the overshot _tick replay a month cycle; this was the "
+        "0xae5633 client crash",
     ),
 ]
 
@@ -109,6 +126,14 @@ MUST_PASS = [
     (
         "a word that merely starts like a keyword",
         b'var classification = "is"\nvar awaitable = true\n',
+    ),
+    (
+        "a date rewind that does discard",
+        b"func __discard_overshoot(date_model):\n"
+        b"\tdate_model.set(\"_tick\", 0.0)\n\n"
+        b"func __pull_date_back(date_model, to_date):\n"
+        b"\tdate_model.set_raw_date(to_date)\n"
+        b"\t__discard_overshoot(date_model)\n",
     ),
 ]
 

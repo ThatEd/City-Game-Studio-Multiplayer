@@ -14,10 +14,10 @@ proven facts; **unknown** = nobody looked; **wrong** = tried, failed, kept so it
 
 | | |
 |---|---|
-| Two players in one world | **proven.** Two live instances, same week on both, each seeing the other as a rival |
+| Two players in one world | **proven.** Two live instances, same week on both, each seeing the other as a rival. A 1500 s run at 6x on the 120-tile map carried both machines from 1976 into 1981 (five in-game years) with neither dying |
 | Either player runs a company | **proven.** Both sides have their own money, offices, staff, games |
 | Trading money / technology / game IP | **proven** by assertion on both machines |
-| Host leaving handled | **proven** on screen — popup, save, main menu |
+| Host leaving handled | **proven** on screen — popup, save, then the main menu (the return was dead code until it was found in a passing run's log; see [DISCONNECT.md](DISCONNECT.md)) |
 | Returning player gets their company back | **proven.** €299,706 against €299,704 stored, office re-interiorated |
 | Three or more players | **unknown.** The protocol is host-plus-N and the relay fans out, but only two have run |
 | A player choosing who they are before entering | **proven.** The lobby lists the host's companies and the game's own create form; the client never enters a world it has not chosen |
@@ -35,7 +35,7 @@ proven facts; **unknown** = nobody looked; **wrong** = tried, failed, kept so it
 | Transfer size limit | `WORLD_PART_SIZE` chunks; a slow reader must not be dropped | **proven** — the relay queues and retries; 24×60 KB test case |
 | Late joiner | Host re-sends the world on `join_request` and the relay caches it | **proven** — "world reaches the joiner, also later" |
 | Map | Host's map is the world's; a client's office tiles are the host's tiles | **proven** |
-| Date / clock | Host is authoritative; a client that drifts is corrected, and the correction emits `month` so the HUD repaints | **proven** — clock on screen asserted against the model |
+| Date / clock | Host is authoritative; a client that drifts is corrected, and the correction repaints the calendar and discards the week it had over-run | **proven** — clock on screen asserted against the model, and a 600 s run passed 1976→1981 on both machines after the overshoot fix |
 | Rivals | Simulated on both machines from the same world snapshot; the client's simulation is muted | **derived.** A rival released *after* a client joined has not been watched on both sides |
 | Conventions | Catalogue (`generated`, `announced`) is the world's and is transferred; `planned`/`running`/`archived`/`autoattend` are per-player | **proven** — client 0 planned / 0 running / 0 archived, auto-attend off, catalogue present |
 
