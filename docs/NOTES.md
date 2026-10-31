@@ -2830,3 +2830,99 @@ client: verify: 30 passed, 0 failed -> ALL OK
   photographed but its controls have not been pressed by an automated run.
 - **The publish-offer list and console panel** have never been looked at as *rendered* panels - the assertions
   read model values, so a panel that displayed them wrongly would still pass.
+
+---
+
+# Pass 36: the lobby's controls, and a design fault behind them
+
+The lobby's five buttons had never been pressed by an automated run. They have now - and pressing them found a
+design fault in the lobby itself, not a bug in the buttons.
+
+## Why they had never been pressed
+
+Two separate reasons, both in the tooling:
+
+- **`press` searches open popups only.** The lobby is a Control the mod adds at the scene root, deliberately,
+  so it can sit above the game before any game exists. It is not a popup, so `press lobby_new` could not find
+  it.
+- **The takeover rows had no names.** `lobby.__fill` built each row as a bare `Button` with a `company_id`
+  meta and no `set_name()`, and the remote channel addresses nodes by name. Twelve rows the player can click
+  were unreachable by any script.
+
+Fixed both: the rows are named `take_<n>` (matching the trade panel's own convention), and there is a new
+`pressany` verb that walks the whole scene tree matching the tail of a path, so a node under a generated name
+(`@@39`) can be addressed at all.
+
+## What was exercised
+
+```
+lobby: showing the company setup screen                       <- lobby_new_pressed
+lobby: back from the company setup screen, showing the choices again   <- lobby_create_back
+lobby: taking over [coop-highland], waiting for it to arrive in this world   <- lobby_takeover_pressed
+lobby: asked the host for the world                            <- lobby_commit
+```
+
+Two of those handlers (`lobby_create_back`, `lobby_create_confirmed`) had **no log line at all**, so a press
+that worked and a press that changed nothing left identical evidence. That is the same defect this project has
+fixed four times now, and it is why the lobby's controls stayed "untested" through several passes that believed
+they had tried them.
+
+## The design fault
+
+Taking over the *host's own company* cannot work, and the lobby offers it anyway:
+
+```
+lobby:   [coop-highland] Highland Studio  1 office(s)  $300004  (player)     <- the host's company
+lobby: chose company coop-highland
+net: company choice coop-highland -> company coop-highland is not in this world, nothing changed
+```
+
+And on a fresh session the list holds **exactly one entry**, which makes the fault worse than it first looked:
+
+    lobby: 1 company/companies to take over, plus a new one
+    lobby:   [coop-highland] Highland Studio  1 office(s)  $300004  (player)
+
+The only thing offered is the one thing that can never work. A larger map does not help: a new world has no
+AI rivals with studios yet, so there is nothing else to list. A player who picks "Take over a company" on a
+fresh session is shown a single broken choice.
+
+`takeover_candidates()` excludes only *this machine's* own company, so on a client the host's company appears in
+the list as a perfectly good thing to take over. Pressing it asks the host for the world, boots it, and then
+`company.choose()` refuses - because the host is *already playing that company*, in that world. The refusal is
+correct; offering the choice is not.
+
+The same applies to any other **player's** company: a client cannot run a company another client is already
+running.
+
+I stopped rather than patching it, because the fix is a design decision rather than a bug fix, and the options
+differ in what the feature means:
+
+1. **Offer only AI rivals and companies whose player has left.** Honest and simple: the lobby becomes "take over
+   a company nobody is playing". `takeover_candidates()` already knows which entries are players and which are
+   `away`, so this is a filter.
+2. **Let a takeover become a hand-over.** The named player is disconnected and the taker takes the seat. That is
+   a real feature with real consequences (the other player is thrown out mid-session).
+3. **Let two players run one company.** Shared control, which this mod deliberately is not.
+
+I have not chosen, because it changes what the feature is for. The write-up records the fault instead of hiding
+it behind a filter I picked unilaterally.
+
+## Verified this pass
+
+| | |
+|---|---|
+| `lobby_new_pressed` | opens the game's own company setup screen |
+| `lobby_create_back` | returns to the choice list |
+| `lobby_takeover_pressed` | commits the choice and asks for the world |
+| `pressany` | reaches nodes under generated names; the whole lobby was unreachable before |
+| Build guards | 28/28 |
+| Relay cases | 16/16 |
+
+## Still open
+
+- The lobby's takeover list, as above - needs a decision.
+- `lobby_cancel_pressed` is the fifth button and is deliberately not pressed in a run: it disconnects the client,
+  which ends the test.
+- **`logo`** unsendable (no `company_logo` on the player model); **`acquired`** refused by design;
+  **`session_request`** sent by nothing.
+- **Rendered panels**: the publish-offer list and the console panel have never been looked at as pixels.

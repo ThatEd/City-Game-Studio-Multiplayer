@@ -1767,6 +1767,9 @@ var __play_view_noted = false
 var __play_screen_since = -1.0
 # When to collapse this client's home offices down to one, or -1 for never. See __finish_join.
 var __single_home_at = -1.0
+# A takeover whose company had not arrived in this world yet. See lobby_takeover_pressed.
+var __takeover_wanted = ""
+var __takeover_at = 0.0
 var __single_home_clean_since = -1.0
 var __single_home_quiet = false
 var __play_gated_noted = false
@@ -2343,6 +2346,7 @@ func lobby_create_confirmed():
 	var panel = __lobby_panel()
 	var name = lobby_lib.company_name_text(panel)
 	if name.strip_edges() == "":
+		coop_log.warning(config.log_name, "lobby: refused to create a company with no name")
 		lobby_lib.show_message(panel, "Your company needs a name before you can join.")
 		return
 	var data = lobby_lib.company_form_data(panel)
@@ -2356,6 +2360,10 @@ func lobby_create_confirmed():
 
 
 func lobby_create_back():
+	# Logged, because this handler had no line at all: a press that worked and a press that changed nothing
+	# left identical evidence, which is how the lobby's controls stayed "untested" through several passes that
+	# believed they had exercised them.
+	coop_log.info(config.log_name, "lobby: back from the company setup screen, showing the choices again")
 	lobby_lib.show_choose_page(__lobby_panel())
 	lobby_lib.show_choices(__lobby_panel(), self, __lobby_entries)
 
@@ -2363,7 +2371,55 @@ func lobby_create_back():
 # Receives the company id as a bound argument from the row's `pressed` signal.
 func lobby_takeover_pressed(company_id):
 	config.company_choice = String(company_id)
+	# The world transfer and the company table arrive separately, and the choice is committed the moment the
+	# world has booted - so `company.choose()` can look for a competitor the client has not been sent yet:
+	#   lobby: chose company coop-highland
+	#   net: world received (53 models), booting
+	#   net: company choice coop-highland -> company coop-highland is not in this world, nothing changed
+	# The rival appeared a few seconds later, on the next company table. So the decision is remembered and the
+	# join waits for the target to exist, rather than being decided against a half-arrived world.
+	__takeover_wanted = String(company_id)
+	__takeover_at = __elapsed + 2.0
+	coop_log.info(config.log_name, "lobby: taking over [%s], waiting for it to arrive in this world" % [
+		config.company_choice
+	])
 	__lobby_commit("company %s" % [config.company_choice])
+
+
+# Finishes a takeover once the company it names is actually in this world. See lobby_takeover_pressed.
+func __tick_takeover_choice():
+	if __takeover_wanted == "" or __elapsed < __takeover_at:
+		return
+	if not models.is_loaded():
+		__takeover_at = __elapsed + 2.0
+		return
+	if company.load_from_world(__takeover_wanted) == null:
+		# Not here yet. Give up after half a minute rather than waiting for ever, and say so.
+		if __elapsed - __takeover_at > 30.0:
+			coop_log.warning(config.log_name, "lobby: gave up waiting for [%s] to appear in this world"
+				% [__takeover_wanted])
+			__takeover_wanted = ""
+		else:
+			__takeover_at = __elapsed + 2.0
+		return
+	# The record is in the world, but `company.choose()` also needs it to be a *rival* on this machine, and the
+	# two arrive separately. Waiting for the rivalry too is what makes this a wait rather than a delay.
+	if company.rival_known(__takeover_wanted) == false:
+		if __elapsed - __takeover_at > 30.0:
+			coop_log.warning(config.log_name, "lobby: [%s] arrived in the world but never became a rival here"
+				% [__takeover_wanted])
+			__takeover_wanted = ""
+		else:
+			__takeover_at = __elapsed + 2.0
+		return
+	var wanted = __takeover_wanted
+	__takeover_wanted = ""
+	coop_log.info(config.log_name, "lobby: [%s] is here now, joining as it" % [wanted])
+	# `__pick_company_pending` was cleared by the first, premature attempt, and __finish_join returns
+	# immediately without it. Setting it again is what makes the retry a retry rather than a no-op.
+	__pick_company_pending = true
+	__hide_lobby()
+	__finish_join()
 
 
 func lobby_cancel_pressed():
@@ -4657,6 +4713,7 @@ func _process(delta):
 	__tick_tutorial()
 	__tick_world_save_id()
 	__tick_takeover_reseat()
+	__tick_takeover_choice()
 	__tick_single_home()
 	__keep_lobby_on_top()
 	__trace("lobbytop")

@@ -1023,6 +1023,11 @@ static func __rival(id):
 	return null
 
 
+# Is this id a live rival on this machine? What company.choose() tests before it will take a company over.
+static func rival_known(id):
+	return __rival(String(id)) != null
+
+
 static func catalogue():
 	return __catalogue_data()
 

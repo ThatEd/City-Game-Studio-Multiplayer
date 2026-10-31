@@ -196,6 +196,8 @@ static func __run(coop, command):
 		return __press_root(coop, arg1)
 	if verb == "pick":
 		return __pick(coop, arg1, rest.strip_edges())
+	if verb == "pressany":
+		return __press_any(coop, arg1)
 	if verb == "date":
 		return __date(coop, arg1, rest.strip_edges())
 	if verb == "own":
@@ -1081,6 +1083,43 @@ static func __research(coop, genre_id):
 	return "unlocked [%s]; now %s genre(s): %s" % [
 		genre_id, String(after.size()), __join(after, " | ")
 	]
+
+
+# Presses a node named by its full path from the scene root, wherever it lives.
+#
+# Neither `press` nor `presspath` could reach the lobby: `press` searches open popups only, and the lobby is
+# not a popup (it is a Control the mod adds at the root, so it can sit above the game before any game
+# exists). `pressroot` takes a path from the root but the lobby's is under a node whose name the engine
+# generates (@@39), so it could not be typed either. The lobby's five buttons had therefore never been
+# pressed by an automated run at all.
+#
+# This walks the whole tree matching the *tail* of the path, so `column/choices/lobby_new` works without
+# knowing the generated node name, and falls back to an exact path when one is given.
+static func __press_any(coop, path):
+	var wanted = String(path)
+	var root = coop.get_tree().get_root()
+	if wanted == "":
+		return "pressany needs a node name or path"
+	# Exact path first.
+	if root.has_node(wanted):
+		return __press_node(root.get_node(wanted), wanted)
+	# Then the tail of a path, ignoring generated node names.
+	var parts = wanted.split("/")
+	var tail = parts[parts.size() - 1]
+	var matches = []
+	__collect_all(root, matches)
+	if matches.size() == 0:
+		return "nothing in the scene tree at all"
+	for node in matches:
+		if String(node.get_name()) != tail:
+			continue
+		var node_path = String(root.get_path_to(node))
+		if wanted.find("/") >= 0 and node_path.find(wanted) < 0:
+			continue
+		if node.has_method("is_visible") and not bool(node.call("is_visible")):
+			continue
+		return __press_node(node, node_path)
+	return "no visible node ending [%s] anywhere in the scene tree" % [tail]
 
 
 static func __dialogs(coop):

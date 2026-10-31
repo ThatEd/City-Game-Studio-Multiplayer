@@ -443,6 +443,10 @@ static func __fill(panel, rows, coop = null):
 	for row in rows:
 		var button = Button.new()
 		var id = String(value_of(row, "id", ""))
+		# Named, because an unnamed button cannot be pressed by any automated run: the remote channel
+		# addresses nodes by name, so these twelve takeover rows were unreachable and `lobby_takeover_pressed`
+		# had never once been exercised. `take_<n>` matches the trade panel's own convention.
+		button.set_name("take_%s" % [String(list.get_child_count() + 1)])
 		button.set_text(__row_text(row))
 		button.set_meta("company_id", id)
 		if coop != null:
