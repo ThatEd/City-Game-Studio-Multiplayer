@@ -287,6 +287,53 @@ static func is_player_company(company_id):
 	return models.get_model("coop-state").has_player(id)
 
 
+# Has this player left the session? `present` is written by the host when somebody joins or a peer departs,
+# and a company the world remembers but nobody is playing has it false - which is exactly the company a new
+# joiner is meant to be able to pick up.
+static func __player_away(player_id):
+	if not models.has_model("coop-state"):
+		# Nothing recorded, so nobody is demonstrably playing it.
+		return true
+	var coop_state = models.get_model("coop-state")
+	if not coop_state.has_method("get_player"):
+		return true
+	var record = coop_state.get_player(String(player_id))
+	if record == null or typeof(record) != TYPE_DICTIONARY:
+		return true
+	if not record.has("present"):
+		# A record with no presence flag has not been seen this session. That is not proof somebody is
+		# playing it, and treating it as present would hide a departed player's company for ever.
+		return true
+	return not bool(record["present"])
+
+
+# Is this player connected to the session right now? This machine, or a client the host has been told about.
+#
+# `coop-state.present` is not usable for this from the host's side: the host never writes `present` for its own
+# record, so its own company reads as "away" and was offered as something a client could take over.
+static func __in_session(player_id, connected = null):
+	var id = String(player_id)
+	if id == "":
+		return false
+	if models.has_model("player"):
+		var me = models.get_model("player").get_data()
+		if me != null and me.has("id") and String(me["id"]) == id:
+			return true
+		# The game's own player id is not the key companies are stored under: the mod keys them by
+		# `coop-<name>` (make_id). Compare against the company name too, so the exclusion works whichever id the
+		# caller supplied.
+		if me != null and me.has("company_name"):
+			var mine = String(me["company_name"])
+			if mine != "" and mine == id:
+				return true
+	if connected == null or typeof(connected) != TYPE_ARRAY:
+		return false
+	for other in connected:
+		if String(other) == id:
+			return true
+	return false
+
+
 # True when a company is another player's, and therefore not something this player may buy out.
 static func is_other_player(company_id, own_id):
 	return is_player_company(company_id) and String(company_id) != String(own_id)
@@ -1052,7 +1099,9 @@ static func catalogue_name(company_id):
 # came over the wire could disagree with the world it describes.
 #
 # Returns a list of {id, name, offices, currency, fanbase, kind, away}, which is what lobby.gd renders.
-static func takeover_candidates():
+# `connected` is the ids of players in this session right now, supplied by the caller because this file is
+# static and cannot see the host's client list. An empty list means "only exclude this machine".
+static func takeover_candidates(connected = null):
 	var out = []
 	if not models.is_loaded() or not models.has_model("concurrent"):
 		return out
@@ -1082,9 +1131,22 @@ static func takeover_candidates():
 			var entry_name = catalogue_name(id)
 			if entry.has("coop_name"):
 				entry_name = String(entry["coop_name"])
-			# Skip an entry that is this machine's own company wearing another id: a stale write from an
-			# older build could leave the player's own name on a rival record, and offering it would let
-			# a player "take over" themselves.
+			# Never offer a company another player is currently running.
+			#
+			# This list used to offer every rival, and a *player's* company is a rival like any other - so a
+			# client was shown the host's own company as something to take over. Pressing it asked for the
+			# world, booted it, and `company.choose()` then refused:
+			#   company choice coop-highland -> company coop-highland is not in this world, nothing changed
+			# which is correct, because the host is already playing it. On a fresh session that broken entry
+			# was the *only* entry in the list, so "Take over a company" led nowhere.
+			#
+			# "Connected right now" is the question, and `coop-state.present` is not the answer: the host never
+			# writes `present` for itself, so on the host - which is the machine that builds this list - its own
+			# company would read as away. The session's own roster is the reliable source: this machine's own
+			# id, and every client the host has been told about.
+			if __in_session(id, connected):
+				coop_log.info("coop", "net: not offering [%s] because somebody is playing it" % [id])
+				continue
 			if own_name != "" and entry_name == own_name:
 				continue
 			out.push_back({
@@ -1107,6 +1169,12 @@ static func takeover_candidates():
 		for player_id in remembered:
 			var id = String(player_id)
 			if id == own_id:
+				continue
+			# The same exclusion, for the same reason. `coop-state` keeps a record for every player the world
+			# has seen, including the ones connected right now - so the host's own company came back in
+			# through this loop after being excluded from the live-rival loop above, and the filter looked
+			# like it did nothing.
+			if __in_session(id, connected):
 				continue
 			if __has_candidate(out, id):
 				continue

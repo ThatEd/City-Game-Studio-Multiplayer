@@ -1328,7 +1328,20 @@ func __send_lobby_summary(player_id):
 		return
 
 	var date = models.get_model("date").get_date()
-	var entries = company.takeover_candidates()
+	# Every player currently connected goes in, so a company somebody is running is not offered as something to
+	# take over.
+	#
+	# This machine's id is `__local_id()` - the `coop-<name>` the mod itself uses everywhere - not the player
+	# model's `id`, which is the game's own and does not match the ids companies are keyed by. Using the model id
+	# matched nothing, so the host's own company stayed in the list and the filter looked like it did nothing.
+	var connected = [__local_id()]
+	for player_id in __client_companies:
+		connected.push_back(String(player_id))
+	var entries = company.takeover_candidates(connected)
+	coop_log.info(config.log_name, "net: takeover list built excluding in-session player(s) %s, offering %s"
+		% [String(connected.size()), String(entries.size())])
+	for excluded_id in connected:
+		coop_log.info(config.log_name, "net:   not offered: [%s]" % [String(excluded_id)])
 	var mine = company.record(__local_id(), null, __rival_game_ids, __world_save_id)
 	__link.send({
 		"t": "session_summary",

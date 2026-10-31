@@ -2926,3 +2926,74 @@ it behind a filter I picked unilaterally.
 - **`logo`** unsendable (no `company_logo` on the player model); **`acquired`** refused by design;
   **`session_request`** sent by nothing.
 - **Rendered panels**: the publish-offer list and the console panel have never been looked at as pixels.
+
+---
+
+# Pass 37: the takeover list, decided and fixed
+
+The last pass stopped on a design fault and asked for a decision. The instruction was to continue, so I took the
+least destructive option and recorded why: **a takeover offers AI rivals and companies whose player has left**.
+That is what the code's own comment already claimed the feature was for ("players who are not connected right
+now, which is exactly who a new joiner most likely wants to pick up"), and it is the only one of the three options
+that neither throws a player out mid-session nor turns this into shared control.
+
+## The change
+
+`takeover_candidates()` now excludes **every company that is being played right now**, and takes the roster from
+its caller:
+
+```
+takeover_candidates(connected)   # connected = this machine's id + every client the host has been told about
+```
+
+It has to be passed in because the file is static and cannot see the host's client list.
+
+## Why the first two attempts did nothing
+
+Worth recording, because it took three runs to find and each step was visible only after adding a log line:
+
+1. **Filtering on `coop-state.present` does not work.** The host never writes `present` for its own record, so on
+   the machine that *builds* the list its own company reads as "away" and is offered anyway.
+2. **Comparing against the player model's `id` does not work either.** The mod keys companies by `coop-<name>`
+   (`make_id`); the game's own player id is a different value, so the exclusion matched nothing. Passing
+   `__local_id()` fixed that.
+3. **The list is built from two loops, and only one was filtered.** Even with the live-rival loop excluding
+   correctly — the log said `not offered: [coop-highland]` — the same company came back through the second
+   loop, which walks `coop-state` for companies the world remembers. That loop checked only the game's own id.
+
+The lesson is the one this pass keeps relearning: `offering 1` next to `not offered: [coop-highland]` is a
+contradiction no amount of reading the first loop could resolve. The count and the name had to be printed
+together.
+
+## Verified
+
+```
+host:   net: takeover list built excluding in-session player(s) 1, offering 0
+client: lobby: 0 company/companies to take over, plus a new one
+client: lobby: showing the company setup screen          <- New still works
+client: lobby: back from the company setup screen, showing the choices again
+```
+
+And there is no takeover row to press (`no node called [take_1]`), on a fresh session where the only candidate was
+the host's own company. Before this pass that row existed, was pressable, and could only fail.
+
+The honest consequence, which the panel now shows rather than hides: **on a fresh session the takeover list is
+empty**, because there is nothing in it that can legitimately be taken over. The lobby's other path — "start a new
+company" — works as before.
+
+## What this does and does not prove
+
+It proves the list no longer offers something that cannot work, and that the filter is what removed it (before:
+`offering 1`, after: `offering 0`, same world, same code path).
+
+It does **not** prove that a departed player's company is still offered, because that needs two clients: one to
+join, have a company, and leave; and another to arrive afterwards and find it. That is the test this change most
+needs and it has not been run — the single-client harness cannot reach it.
+
+## Still open
+
+- **A departed player's company being offered** - needs a two-client run, as above.
+- **`logo`** unsendable (no `company_logo` on the player model); **`acquired`** refused by design;
+  **`session_request`** sent by nothing.
+- **Rendered panels**: the publish-offer list and console panel have never been looked at as pixels.
+- **`lobby_cancel_pressed`** is deliberately not pressed in a run: it disconnects the client and ends the test.
