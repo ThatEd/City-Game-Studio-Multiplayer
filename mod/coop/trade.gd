@@ -145,7 +145,7 @@ static func pending_for(player_id):
 
 
 # Records an offer in the world's company section, under both players, so either side can find it.
-static func store(offer):
+static func store(offer, log_name = "coop"):
 	if not models.has_model("coop-state"):
 		return false
 	# A copy of an offer can arrive again after it was settled (the host relays, clients re-ask); the
@@ -153,14 +153,29 @@ static func store(offer):
 	if is_settled(String(offer["id"])):
 		return false
 	var coop = models.get_model("coop-state")
+	var stored = 0
 	for player_id in [String(offer["from"]), String(offer["to"])]:
 		var entry = coop.get_player(player_id)
 		if entry == null:
-			continue
+			# The entry is created rather than skipped.
+			#
+			# `continue` here dropped offers on the floor. On a client, the host's coop-state entry does
+			# not exist until the host's company record has arrived and been saved into the world - and an
+			# offer can arrive first. The offer then vanished: the client logged "coop-highland offered the
+			# LABEL_TYPE_SPACE technology", stored nothing, and the panel correctly reported "0 pending
+			# offer(s)". Nothing failed, so nothing was noticed.
+			entry = {name = String(player_id)}
+			coop.set_player(player_id, entry)
+			coop_log.info(log_name, "trade: created the coop-state entry for %s to hold an offer"
+				% [String(player_id)])
 		if not entry.has("offers") or entry["offers"] == null:
 			entry["offers"] = {}
 		entry["offers"][String(offer["id"])] = offer
-	return true
+		stored += 1
+	if stored == 0:
+		coop_log.warning(log_name, "trade: could not store %s in either player's section"
+			% [String(offer["id"])])
+	return stored > 0
 
 
 static func set_status(offer_id, status):

@@ -243,7 +243,7 @@ static func refresh(panel, coop, log_name):
 			game_ids.push_back("")
 		__fill_options(games, labels, game_ids)
 
-	__refresh_offers(panel, coop)
+	__refresh_offers(panel, coop, log_name)
 
 	var departed = panel.find_node("departed", true, false)
 	if departed != null:
@@ -259,15 +259,25 @@ static func refresh(panel, coop, log_name):
 		__fill_options(departed, gone_labels, gone_ids)
 
 
-static func __refresh_offers(panel, coop):
+static func __refresh_offers(panel, coop, log_name):
 	var offers_box = panel.find_node("offers", true, false)
 	if offers_box == null:
+		# The box is built by __build_panel, so this means the panel is not the one this code builds -
+		# worth a line rather than a silent return, because it is otherwise indistinguishable from "no
+		# offers arrived".
+		coop_log.info(log_name, "ui: the panel has no offers box, so no offer row can be shown")
 		return
 	for child in offers_box.get_children():
 		offers_box.remove_child(child)
 		child.queue_free()
 
 	var waiting = coop.ui_pending_offers()
+	# Logged, because this is the join that has gone wrong twice and left no trace either time: an offer
+	# that arrived, was stored, and never appeared as a row looks exactly like an offer that never arrived.
+	# The count here is the only place that says which.
+	coop_log.info(log_name, "ui: offers box shows %s of %s pending offer(s)" % [
+		String(min(waiting.size(), MAX_OFFER_ROWS)), String(waiting.size())
+	])
 	var shown = 0
 	for offer in waiting:
 		if shown >= MAX_OFFER_ROWS:

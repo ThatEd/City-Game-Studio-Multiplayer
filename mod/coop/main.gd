@@ -1,4 +1,4 @@
-﻿extends Node
+extends Node
 
 # Co-op mod entry point, loaded as the `coop` autoload (autoload/coop in engine.cfb).
 #
@@ -1113,7 +1113,7 @@ func __handle_server_message(message):
 		var offer = dict_lib.field(message, "offer", null)
 		if offer == null:
 			return
-		trade.store(offer)
+		trade.store(offer, config.log_name)
 		coop_log.info(config.log_name, "trade: %s" % [trade.describe(offer)])
 		# The host may be the one being given something.
 		__maybe_accept(offer)
@@ -1193,7 +1193,7 @@ func __handle_server_message(message):
 		var offer = dict_lib.field(message, "offer", null)
 		if offer == null:
 			return
-		trade.store(offer)
+		trade.store(offer, config.log_name)
 		coop_log.info(config.log_name, "trade: %s" % [trade.describe(offer)])
 		# The recipient takes it on their own machine; the host only relays and records.
 		__maybe_accept(offer)
@@ -2212,11 +2212,15 @@ func __own_published_game(game_id):
 
 
 func __send_offer(offer):
-	trade.store(offer)
-	# A client asks the host to register it; the host registers and relays. Sent to the world either way,
-	# so the host records what a client gives away.
+	# Sent first, then stored. The order matters: this is the whole point of pressing the button, and a
+	# fault in anything that follows it must not take the message with it. An earlier version stored and
+	# sent, then the caller repainted the panel - and a raise in that repaint left the offer recorded here
+	# and never sent to the other player.
 	__link.send({"t": "offer_request", "offer": offer})
 	coop_log.info(config.log_name, "trade: sent %s" % [trade.describe(offer)])
+	# A client asks the host to register it; the host registers and relays. Sent to the world either way,
+	# so the host records what a client gives away.
+	trade.store(offer, config.log_name)
 
 
 func __maybe_accept(offer):
@@ -2663,12 +2667,16 @@ func ui_offer_money():
 func ui_offer_technology():
 	var target = ui_lib.selected_player(__game_panel)
 	if target == "":
-		ui_lib.set_status(__game_panel, "no other player to give to yet")
+		__ui_refused("technology", "no other player to give to yet")
 		return
 	var genre = ui_lib.selected_genre(__game_panel)
 	if genre == "":
-		ui_lib.set_status(__game_panel, "they already know everything we do")
+		# Reachable and silent before this: pressing Give on the technology row with nothing chosen
+		# logged nothing at all, so a run that pressed it looked like a run that had never tried. The
+		# status line it does set is on a panel nobody is reading in an automated run.
+		__ui_refused("technology", "they already know everything we do")
 		return
+	coop_log.info(config.log_name, "ui: offering the %s technology to %s" % [genre, ui_player_name(target)])
 	offer_technology(target, genre)
 	ui_lib.set_status(__game_panel, "offered a technology to %s" % [ui_player_name(target)])
 	ui_refresh()
@@ -2677,15 +2685,29 @@ func ui_offer_technology():
 func ui_offer_ip():
 	var target = ui_lib.selected_player(__game_panel)
 	if target == "":
-		ui_lib.set_status(__game_panel, "no other player to give to yet")
+		__ui_refused("IP", "no other player to give to yet")
 		return
 	var game_id = ui_lib.selected_game(__game_panel)
 	if game_id == "":
-		ui_lib.set_status(__game_panel, "no published game to give")
+		__ui_refused("IP", "no published game to give")
 		return
+	coop_log.info(config.log_name, "ui: offering the IP of [%s] to %s" % [
+		game_id, ui_player_name(target)
+	])
 	offer_ip(target, game_id)
 	ui_lib.set_status(__game_panel, "offered the IP of %s" % [game_id])
 	ui_refresh()
+
+
+# A button that does nothing must say so in the log.
+#
+# The status line it sets is on the Multiplayer panel, which no automated run and no screenshot of the game
+# reads. A press that was refused and a press that was never made therefore left identical evidence - which
+# is how "the technology button was never exercised" stayed true through several passes that believed they
+# had exercised it.
+func __ui_refused(what, why):
+	coop_log.info(config.log_name, "ui: %s offer not made (%s)" % [what, why])
+	ui_lib.set_status(__game_panel, why)
 
 
 func ui_accept_offer(offer_id):

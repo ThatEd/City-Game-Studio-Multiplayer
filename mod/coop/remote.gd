@@ -139,6 +139,12 @@ static func tick(coop):
 		# the log: "running" is the last line for a command that never came back.
 		coop_log.info(coop.config.log_name, "remote: --- %s: %s (running)" % [String(seq), command])
 		var answer = __run(coop, command)
+		if answer == null:
+			# Never silent. A command whose implementation raises produces no answer at all, and the log
+			# then shows "(running)" and nothing else - which is indistinguishable from the game hanging,
+			# and is how `pick` looked for two runs while the real fault was an extra argument to a
+			# two-parameter call. The command name is repeated so the reader knows which one it was.
+			answer = "command [%s] produced no answer (it raised; see the line above)" % [command]
 		__answer(coop, seq, command, answer)
 		return
 
@@ -188,6 +194,8 @@ static func __run(coop, command):
 		return __findall(coop, arg1)
 	if verb == "pressroot":
 		return __press_root(coop, arg1)
+	if verb == "pick":
+		return __pick(coop, arg1, rest.strip_edges())
 	if verb == "date":
 		return __date(coop, arg1, rest.strip_edges())
 	if verb == "own":
@@ -196,6 +204,10 @@ static func __run(coop, command):
 		return __clock(coop)
 	if verb == "trends":
 		return __trends(coop)
+	if verb == "research":
+		# arg1, not rest: `research fight` has no third word, and rest is empty for a two-part command.
+		# Passing rest meant this verb only ever listed the known genres, for every argument.
+		return __research(coop, arg1 if rest.strip_edges() == "" else rest.strip_edges())
 	if verb == "lobby":
 		return __lobby(coop, arg1, rest.strip_edges())
 	return "unknown command [%s]; try tree, find, findall, press, fill, call, menu, menuitem, dialogs, " \
@@ -982,6 +994,80 @@ static func __trends(coop):
 	return company_join(lines)
 
 
+# Chooses an item in an OptionButton, and says what it now shows.
+#
+# There was no way to do this at all, which left every path behind a dropdown unreachable by any automated
+# run: `call genres select` cannot pass an argument, so the technology and IP buttons could only ever be
+# pressed with nothing selected - and until this pass they returned silently in that case, so the evidence
+# of a refused press was identical to the evidence of no press.
+static func __pick(coop, name, text):
+	var node = __find_node(coop, name)
+	if node == null:
+		return "no node called [%s]" % [name]
+	if not node.has_method("get_item_count") or not node.has_method("select"):
+		return "[%s] is not an option list" % [name]
+	var wanted = String(text).strip_edges()
+	var count = int(node.call("get_item_count"))
+	if count == 0:
+		return "[%s] has no items" % [name]
+	var chosen = -1
+	var index = 0
+	while index < count:
+		if String(node.call("get_item_text", index)) == wanted:
+			chosen = index
+			break
+		index += 1
+	if chosen < 0:
+		var options = []
+		index = 0
+		while index < count:
+			options.push_back(String(node.call("get_item_text", index)))
+			index += 1
+		return "[%s] has no item [%s]; it has %s" % [name, wanted, __join(options, " | ")]
+	node.call("select", chosen)
+	# select() is enough: nothing in this project listens for item_selected (there is no connection to it
+	# anywhere), and emitting a signal with no listeners raised inside the command and produced no answer
+	# at all - so every pick of a real item failed while a pick of a missing item answered correctly, which
+	# is the worst possible way round for a diagnostic. The panel is repainted by the next action, and
+	# `offer_tech` reads the selection when it is pressed.
+	return "[%s] now shows [%s]" % [name, String(node.call("get_item_text", chosen))]
+
+
+# Researches a genre, through the game's own model, so the technology trade can be exercised.
+#
+# The technology is transferable only if the two players know different genres, and two fresh companies
+# start with the same one - so on a fresh game the panel's technology row is legitimately empty ("nothing
+# they are missing") and the offer path cannot be reached at all. A player reaches it by researching, which
+# is what `--coop-play`'s research action does; this is the same call without a playtest.
+static func __research(coop, genre_id):
+	if not models.has_model("game-type"):
+		return "no game-type model"
+	var gametype = models.get_model("game-type")
+	var mine = gametype.get_unlocked_game_types()
+	# Only ids the model actually knows. `unlock_game_type` writes whatever it is given into its `_types`
+	# dictionary and does not check, so `research fight` reported "unlocked [fight]; now 1 genre(s)" and
+	# changed nothing at all: `get_unlocked_game_types()` walks `type_static_data`, which has no "fight".
+	# A diagnostic that reports success without verifying is worse than one that refuses.
+	if String(genre_id) == "":
+		var known = []
+		for type_id in gametype.type_static_data:
+			known.push_back(String(type_id))
+		return "known genres: %s; all genres: %s" % [__join(mine, " | "), __join(known, " | ")]
+	if not gametype.type_static_data.has(String(genre_id)):
+		return "[%s] is not a genre this build knows" % [genre_id]
+	if gametype.is_game_type_unlocked(String(genre_id)):
+		return "[%s] is already known" % [genre_id]
+	gametype.unlock_game_type(String(genre_id), true)
+	var after = gametype.get_unlocked_game_types()
+	if not after.has(String(genre_id)):
+		return "tried to unlock [%s] but it still is not in the list; now %s" % [
+			genre_id, __join(after, " | ")
+		]
+	return "unlocked [%s]; now %s genre(s): %s" % [
+		genre_id, String(after.size()), __join(after, " | ")
+	]
+
+
 static func __dialogs(coop):
 	var lines = []
 	var root = coop.get_tree().get_root()
@@ -1075,4 +1161,16 @@ static func company_join(lines):
 	var out = ""
 	for line in lines:
 		out += String(line) + "\n"
+	return out
+
+
+# One line, joined with a separator. company_join takes a single argument (a list of lines) and this is the
+# different job: a list of items on one line. Calling it with a separator silently produced no answer at
+# all, because the extra argument is an error and an error inside a command is swallowed by the caller.
+static func __join(items, separator):
+	var out = ""
+	for item in items:
+		if out != "":
+			out += separator
+		out += String(item)
 	return out

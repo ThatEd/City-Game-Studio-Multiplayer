@@ -2283,3 +2283,91 @@ as a month boundary passed.
 A game released from the UI (`published` becoming 1) — reachable now, but the playtest has not completed a
 project since the clock was unstuck. The publish-offer list and the console panel as rendered panels.
 Per-player progression over a year. The RichTextLabel fault at `0x5111bb` reproduced on demand.
+
+---
+
+# Pass 30: the trade panel, driven for the first time
+
+Every previous trade test called `offer_money()` and `__accept_offer()` directly. Nothing had ever pressed a
+button on the Multiplayer panel, so all sixteen `ui_*` callbacks were unexercised - and three of them were
+broken in ways that no log would ever have shown, because a refused button and a button nobody pressed left
+identical evidence.
+
+## What the panel does now, verified by pressing it
+
+Driven entirely through the real controls (`press coop_button`, `fill amount`, `pick genres ...`,
+`press offer_money` / `offer_tech` / `offer_ip`, `press take_1`, `press refuse_1`):
+
+| Button | Result |
+|---|---|
+| money offer | `ui: offer money asked with [15000]` → money moved on acceptance |
+| **Take** | `ui: taking ...` → `trade: money 15000 received` → both sides applied |
+| **Refuse** | `ui: refusing ...` → `trade: refused ...` → the sender saw `was turned down` |
+| **technology offer** | the receiving machine went from `action` to `action \| sport` |
+| **technology offer, reverse** | the host offered, the client took, `offer_accepted` went on the wire |
+
+`offer_reject`, `offer_rejected` and `offer_accepted` had **never been sent by anything** before this pass.
+That is the same closed-loop defect `continue_without` had: a handler that can only fire on a message
+nothing produces. All three are now on the wire in a real run, and the census says so:
+
+```
+client sent     offer=1 offer_accepted=1
+client received offer_accept=1 offer_request=1
+```
+
+## Four bugs, all invisible from the log
+
+**`__refresh_offers()` had no log and no signature.** Adding a line to it revealed that it took
+`(panel, coop)` and nothing supplied a log name - and it returned silently when the offers box was missing.
+So the offers box could be empty for a reason nobody would ever see. It takes `log_name` now and says what
+it is showing: `ui: offers box shows 1 of 1 pending offer(s)`.
+
+**An offer was dropped on the floor, silently.** `trade.store()` skipped any player whose coop-state entry
+did not exist yet. On a client the *host's* entry does not exist until the host's company record has
+arrived, and an offer can arrive first - so the client logged `coop-highland offered the LABEL_TYPE_SPACE
+technology`, stored nothing, and the panel correctly reported "0 pending offer(s)". The entry is created
+now, and a store that fails on both sides warns.
+
+**The send came after the store, and a raise in between lost it.** `__send_offer` stored the offer and then
+sent it, and the caller repainted the panel afterwards. When that repaint raised, the offer was recorded
+locally and never sent - the button appeared to do nothing at all. It is sent first now: the message is the
+point of the button.
+
+**`trade.gd` used `config.log_name` in a file that has no `config`.** That raised inside `store`, inside
+`__send_offer`, every time a technology was offered. It is passed in now.
+
+## Two instruments that lied in the worst direction
+
+Both were mine, and both failed *only when things worked*:
+
+- **`pick` raised whenever it found the item.** It called `emit_signal("item_selected", chosen)`, and
+  nothing in this project listens for `item_selected` - so picking a real genre produced no answer at all,
+  while picking a missing one answered correctly. Removed; `select()` is enough.
+- **`research` reported success without checking.** `unlock_game_type("fight", true)` wrote a dictionary
+  entry for a genre the model does not know and returned; the verb announced `unlocked [fight]; now 1
+  genre(s)`. It validates against `type_static_data` and re-reads the list before claiming anything, and
+  there is now a `.txt`-free way to enumerate the real ids (`research` with no argument).
+
+And `remote.gd` had no guard at all for a command that raises: it printed `(running)` and stopped. A
+command that produces no answer now says so by name, which is what turned both faults above from
+"the channel is flaky" into a line with a cause.
+
+## Instrumentation added
+
+- `pick <option> <text>` - chooses an OptionButton item and reports what it now shows. Without it every
+  path behind a dropdown was unreachable, which is why the technology and IP rows had never been tested.
+- `research [genre]` - unlocks a genre through the game's own model, so the technology trade has something
+  to transfer (two fresh companies know the same single genre, so the row is legitimately empty).
+- `clock` and `trends` on the remote channel, reporting the conditions that freeze the clock and the
+  trend-table fingerprint.
+
+## Still not covered
+
+- **The IP transfer.** `ui_offer_ip` is reachable and now logs honestly (`IP offer not made (no published
+  game to give)`), but nothing has ever had a published game to give, because the playtest has not yet
+  released one.
+- **The lobby's own buttons.** `lobby_new_pressed`, `lobby_create_confirmed`, `lobby_create_back`,
+  `lobby_takeover_pressed` and `lobby_cancel_pressed` have only ever been driven by `--coop-autojoin`.
+- **`logo`.** Still never sent: the player model has no `company_logo`, so there is nothing to send.
+- **`acquired`.** Refused by the buyout guard, by design.
+- **`session_request`.** Handled, sent by nothing.
