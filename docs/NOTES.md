@@ -2164,3 +2164,122 @@ keeping one is a decision rather than an oversight.
 Still never observed: a game released from the UI (`published` becoming 1), the publish-offer list and
 console panel as rendered panels, per-player progression over a year, and the `0x5111bb` RichTextLabel
 fault reproduced on demand.
+
+---
+
+# Pass 29: the trends were never shared
+
+Reported by the owner, not found by a test: **"Trends aren't synced"**.
+
+## The bug
+
+Every theme has a trend: a twelve-number ring of monthly values plus a delta, re-rolled on every month
+boundary. It is what the project screen prices a genre against, so it decides how much a game is worth
+making.
+
+`src/scripts/controllers/game-theme.gd:41` connects it to the **local** date model:
+
+```
+date_model.connect("month", self, "update_trends")
+```
+
+and `update_trends()` calls `_generate_trend()` — `seed(0, MAX_VARIATION_PER_MONTH + 1)` — for every
+theme, then writes the new number into the slot for the current month. So on every machine, at every
+month boundary, a fresh random number is rolled.
+
+There was nothing to notice this. Both machines see the same week, the same competitors and the same
+companies, because all of that is either broadcast or derived from the host. The trend table was the one
+piece of shared state that each machine generated for itself, and it was generated from `randi`. From
+the first month boundary onward two players in one world were pricing the same project against different
+markets. Nothing logged it. Nothing asserted it. It is invisible by construction.
+
+## The fix
+
+The trends now ride on the company table, which the host already publishes every few seconds:
+
+- The host appends `trends = {table, themes, total, month}` **when it has changed**, so a steady month
+  sends nothing extra.
+- The client never rolls trends: `update_trends` was added to `COMPETITOR_HANDLERS`, which the existing
+  `__disable_competitor_simulation()` already disconnects from a client's date model. That is the same
+  mechanism that stops a client simulating its own rivals, used for the same reason.
+- The client applies the table and compares **at the moment of applying**: the sum it computes must equal
+  the sum the host sent.
+
+An empty table is refused rather than published — the first version sent `0 theme(s), sum 0` before the
+host's own model was built, and a client that missed the second table would have had no trends at all.
+
+## What the assertion caught, twice
+
+The first version of the check compared the host's current sum against the client's, whenever the verify
+suite ran. It failed on a healthy session:
+
+```
+host sent sum 2298 month 170, applying it gave sum 2298 month 222
+```
+
+Same sum, different month slice — because `update_trends()` rewrites one number per theme on every month
+boundary and, at 6x, a month is under ten seconds. **Two correct machines differ a few seconds apart.**
+A check comparing them at an arbitrary moment is measuring the clock, not the sync.
+
+So the assertion was narrowed to what actually proves the claim: the invariant is checked at the instant
+of applying, where the client's table must equal the one just received. A later sample proves nothing.
+
+Then the negative direction was tested, and it worked too well: disabling the client's apply was
+**refused by the build** —
+
+```
+main.gd:1651: __apply_host_trends() is defined and never called;
+either call it or delete it, and add it to ALLOWED_DEAD with a reason
+```
+
+— which is `check_dead_functions()` doing exactly its job on a regression I had just introduced.
+
+## Verified
+
+Two players, 6x, 1976 into 1980 (four years of month boundaries):
+
+| | host | client |
+|---|---|---|
+| verdict | `30 passed, 0 failed` | `30 passed, 0 failed` |
+| the trend table check | `48 theme(s), sum 2288, host, not compared` | `48 theme(s), sum 2276, took the host's table and it applied exactly` |
+| sync warnings | — | **0**, across eleven publishes |
+
+Repeated across `TRD3`, `TRD5`, `TRD7`, `TRD8`. Before the fix the same check would have failed as soon
+as a month boundary passed.
+
+## Also in this pass
+
+- **The relay could be killed by a stray print.** `tools/run-coop.ps1` started the relay with its streams
+  redirected, exactly as `run-three.ps1` used to. `log()` can no longer raise, but a `print()` anywhere
+  else still could, and an exception there leaves `serve_forever()`. Both runners now capture stderr to
+  `<run>-relay.err.log`, which is also the file that says why a relay died.
+- **`0xae5633` reproduced, and it is the release path.** A published game crossing the wire was enough to
+  kill the host one second later. `company.publish_offers()` was building a proposal from six fields while
+  the game's own `_create_trade_publish_game()` builds fifteen, and the publish-offer screen reads all of
+  them — a native access violation on the first missing member. It had never been hit because releasing
+  was switched off behind `--coop-play-release`. The proposal is now a complete game record.
+- **`--coop-play-release` and engine creation.** A brand-new company owns no engine and has no default
+  one, so the playtest could never start a project: `get_default_engine()` returns `{id, type}`, not an
+  id. It now builds its first engine through the game's own `create_engine` controller and falls back to a
+  rentable engine when the world offers one.
+- **The playtest could never finish a project.** The game freezes its clock
+  (`controllers/date.gd compute_state()`) unless the state model is in view mode **and** no screen is on
+  the scene stack. Starting a project opens the game's own design screen and leaves it there, so no week
+  ever passed and `hold` stayed empty. The bot now closes such a screen — and the *first* version of that
+  forced `back(true)` and crashed the host at `0xae5633`, because those screens are protected and pulling
+  one down mid-transition tears it apart. It waits, then uses the same unforced `back()` the Back button
+  uses.
+- **A cooperative consequence worth knowing.** The project screens are protected, so a player cannot
+  dismiss one — which means **while the host is on the project screen the shared clock stops for
+  everybody.** That is correct for a shared calendar, and it used to look like the session breaking; the
+  log now says which of the two conditions is holding the clock.
+- **The client stuttered the calendar while the host's screen was open.** Its date kept ticking and was
+  pulled back every three seconds — twenty rewinds in three minutes — because it did not know the host had
+  frozen. The clock message now carries `frozen` and the client follows it, so the stutter stops at its
+  source rather than being corrected afterwards.
+
+## Still never observed
+
+A game released from the UI (`published` becoming 1) — reachable now, but the playtest has not completed a
+project since the clock was unstuck. The publish-offer list and the console panel as rendered panels.
+Per-player progression over a year. The RichTextLabel fault at `0x5111bb` reproduced on demand.

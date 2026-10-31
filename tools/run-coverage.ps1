@@ -17,7 +17,11 @@ param(
     # which is the only path that produces the `acquired` message.
     [string]$BuyTest = "",
     # --coop-play=<seconds> is the two-bot run; it is the only thing that produces a `digest`.
-    [int]$Play = 0
+    [int]$Play = 0,
+    # Release and publish finished projects. Off by default in the mod because publishing changes the
+    # game list on the wire and something in the rival-game path used to crash this build at 0xae5633 -
+    # which the overshoot discard fixed. This switch is what exercises a real release.
+    [switch]$PlayRelease
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,6 +69,10 @@ if ($BuyTest -ne "") { $hostArgs += "--coop-buytest=$BuyTest" }
 if ($Play -gt 0) {
     $hostArgs += "--coop-play=$Play"
     $clientArgs += "--coop-play=$Play"
+}
+if ($PlayRelease) {
+    $hostArgs += "--coop-play-release"
+    $clientArgs += "--coop-play-release"
 }
 
 $hostProc = Start-Process -FilePath $exe -ArgumentList $hostArgs -WorkingDirectory $out -PassThru

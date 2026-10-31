@@ -105,7 +105,12 @@ const COMPETITOR_HANDLERS = ["crack_player_game", "release_games", "compute_sale
 	"compute_end_of_month", "_increase_angryness", "announce_games", "_update_consoles",
 	"generate_concurrents_employees", "_yearly_computation", "_generate_buy_each_others",
 	"_update_concurrents", "compute_event", "_generate_trade_orders", "remove_concurrent",
-	"_concurrent_created", "_concurrent_removed"]
+	"_concurrent_created", "_concurrent_removed",
+	# The market's opinion of each genre. controllers/game-theme.gd connects this to the date model's
+	# `month` signal and `update_trends()` rolls fresh random numbers for every theme, so a client that
+	# ran it would invent its own market at every month boundary and the two players would price the same
+	# project differently. The host's table is published and applied instead.
+	"update_trends"]
 # Model JSON is cut into slices this size so no single string operation is huge.
 const WORLD_PART_SIZE = 60000
 
@@ -171,6 +176,13 @@ var __world_models = {}
 var __world_expected = 0
 var __world_parts = {}
 var __competitors_muted = false
+# The host's trend table, as published: {total, month} is enough to prove both machines agree, and the
+# whole table is applied to this client's model so its project screen prices a genre the same way.
+var __host_trends = null
+var __trends_signature_sent = ""
+var __trends_sent_noted = false
+var __trends_applied_noted = false
+var __trends_mismatch = ""
 var __client_companies = {}
 var __company_logos = {}
 var __rival_game_ids = {}
@@ -922,7 +934,13 @@ func __host_publish_companies():
 	for player_id in __client_companies:
 		table.push_back(__client_companies[player_id])
 
-	__link.send({"t": "companies", "companies": table})
+	var payload = {"t": "companies", "companies": table}
+	# The host's market rides with its company table: see __trends_if_changed.
+	if config.role == "host":
+		var trends = __trends_if_changed()
+		if trends != null:
+			payload["trends"] = trends
+	__link.send(payload)
 	__apply_company_table(table)
 	# Named, because a wrong id here silently renames this machine's own company to another player's.
 	var table_ids = []
@@ -1007,6 +1025,12 @@ func __handle_server_message(message):
 
 	elif message["t"] == "companies":
 		__apply_company_table(dict_lib.field(message, "companies", []))
+		# The host's trend table rides with the company table. Each machine used to roll its own trends on
+		# every month boundary, so two players in one world saw different markets from the first month
+		# onward - the same project priced differently on each screen, with nothing logged to say so.
+		var published_trends = dict_lib.field(message, "trends", null)
+		if published_trends != null and config.role == "client":
+			__apply_host_trends(published_trends)
 
 	elif message["t"] == "world_begin":
 		__world_models = {}
@@ -1462,6 +1486,31 @@ func __world_paused():
 
 # Whoever flips the pause or the freeze, the log says when and what the game's own flags were. Without
 # this a "paused" line with no matching cause is indistinguishable from a bug in the mod itself.
+# Which of the two conditions in controllers/date.gd compute_state() is holding the clock.
+func __freeze_cause():
+	if not models.has_model("state"):
+		return "no state model"
+	var parts = []
+	var state_model = models.get_model("state")
+	if state_model.has_method("is_view_mode"):
+		var view = bool(state_model.call("is_view_mode"))
+		if not view:
+			parts.push_back("not in view mode")
+	var screens = -1
+	if scene_manager != null and scene_manager.has_method("get_number_of_scene"):
+		screens = int(scene_manager.call("get_number_of_scene"))
+	if screens > 0:
+		parts.push_back("%s game screen(s) open" % [String(screens)])
+	if parts.size() == 0:
+		return "neither condition explains it"
+	var text = ""
+	for part in parts:
+		if text != "":
+			text += ", "
+		text += String(part)
+	return text
+
+
 func __watch_pause():
 	if not models.is_loaded():
 		return
@@ -1475,8 +1524,13 @@ func __watch_pause():
 		])
 	if frozen != __last_freeze:
 		__last_freeze = frozen
-		coop_log.info(config.log_name, "clock: freeze is now %s (paused=%s)" % [
-			String(frozen), String(paused)
+		# Why, because "freeze is now True" is not answerable on its own. The game freezes its clock when
+		# the player is not in view mode *or* when a game screen is open (controllers/date.gd
+		# compute_state), and opening the project screen is an ordinary thing for a host to do. Any player
+		# doing it stops the shared clock for everybody - which the mod must keep, since time only moves
+		# when every player is ready, but which used to look like the session breaking.
+		coop_log.info(config.log_name, "clock: freeze is now %s (paused=%s, %s)" % [
+			String(frozen), String(paused), __freeze_cause()
 		])
 
 
@@ -1486,10 +1540,186 @@ func __broadcast_clock():
 		t = "clock",
 		raw_date = int(date_model.get_raw_date()),
 		speed = int(date_model.get_speed_index()),
-		paused = __world_paused()
+		paused = __world_paused(),
+		# The game freezes its own clock while a project screen is open (`controllers/date.gd`
+		# compute_state: not in view mode, or a game screen on the stack). That is the host's own state
+		# and the client has to follow it, or the client keeps ticking: the host sat on its design screen
+		# for three minutes while the guest advanced a week every three seconds and was pulled back every
+		# time - twenty rewinds, a stuttering calendar and a burning CPU, for a world that was correctly
+		# not moving. Sent explicitly rather than inferred, because `paused` is the *player's* switch and
+		# this is the game's.
+		frozen = bool(__date_frozen(date_model))
 	}
 	__link.send(message)
 	__apply_clock(message)
+
+
+# This machine's trend fingerprint right now: {themes, total, month}.
+func __trend_fingerprint_now():
+	var out = {themes = 0, total = 0, month = 0}
+	if not models.has_model("game-theme"):
+		return out
+	var theme_model = models.get_model("game-theme")
+	var data = theme_model.get_data()["trends"] if theme_model.has_method("get_data") else null
+	if data == null:
+		return out
+	var month = int(models.get_model("date").get_date().month)
+	var total = 0
+	var this_month = 0
+	var themes = 0
+	for name in data:
+		var series = data[name]
+		if series == null:
+			continue
+		themes += 1
+		var index = 0
+		while index < series.size():
+			total += int(series[index])
+			if index == month:
+				this_month += int(series[index])
+			index += 1
+	out["themes"] = themes
+	out["total"] = total
+	out["month"] = this_month
+	return out
+
+
+# A stable fingerprint of this machine's trend table, plus whether it is the host's.
+#
+# The comparison is a sum over every theme and every month plus the current month's slice, because the
+# table is a dictionary of twelve-number lists and comparing those by reference across two processes
+# proves nothing. On the host there is nothing to compare against, so it reports its own fingerprint and
+# passes; on a client it must equal what the host published.
+func __trend_fingerprint():
+	var now = __trend_fingerprint_now()
+	var out = {ok = true, themes = now["themes"], total = now["total"], month = now["month"],
+		why = "host, not compared"}
+	if not models.has_model("game-theme"):
+		out["ok"] = false
+		out["why"] = "no game-theme model"
+		return out
+	var month = int(models.get_model("date").get_date().month)
+	var total = int(now["total"])
+	var this_month = int(now["month"])
+	if config.role != "client":
+		return out
+	# The moment that matters has already passed: what proves this client is running the host's market is
+	# that applying the host's table gave exactly the fingerprint the host sent. A comparison made here,
+	# minutes later, only says both machines have been ticking - `update_trends()` rewrites one number per
+	# theme per month boundary, so two correct machines differ a few seconds apart.
+	if __trends_mismatch != "":
+		out["ok"] = false
+		out["why"] = __trends_mismatch
+		return out
+	if __host_trends == null or __host_trends.size() == 0:
+		out["ok"] = false
+		out["why"] = "the host has published no trend table"
+		return out
+	out["why"] = "took the host's table and it applied exactly"
+	return out
+
+
+# The trend table when it has changed since the last publish, or null.
+#
+# Rides on the company table rather than travelling as its own message. A separate `companies` message with
+# an empty list would have been applied as an empty table, pruning every rival on the client; a new message
+# kind would need its own census entry and its own handler for one dictionary. The company table is already
+# published every few seconds and already reaches every client, so the trends attach to it and the
+# comparison means a steady month sends nothing extra.
+func __trends_if_changed():
+	var current = __trend_table_message()
+	if current == null:
+		return null
+	var signature = "%s/%s/%s" % [
+		String(int(current["themes"])), String(int(current["total"])), String(int(current["month"]))
+	]
+	if signature == __trends_signature_sent:
+		return null
+	__trends_signature_sent = signature
+	if not __trends_sent_noted:
+		__trends_sent_noted = true
+		coop_log.info(config.log_name, "net: publishing the trend table (%s theme(s), sum %s)" % [
+			String(int(current["themes"])), String(int(current["total"]))
+		])
+	return current
+
+
+# Applies the host's trend table to this client's model, and keeps the fingerprint the verify suite reads.
+#
+# Sent one-way, host to client, and only when it has actually changed: the table is one twelve-number list
+# per theme, which is a few hundred numbers, and re-sending it every few seconds would be waste. The host
+# re-rolls it once a month (and on load), so a change is what a client needs to hear about.
+func __apply_host_trends(published):
+	if not models.has_model("game-theme"):
+		return
+	var theme_model = models.get_model("game-theme")
+	var table = dict_lib.field(published, "table", null)
+	if table == null or not theme_model.has_method("set_trends"):
+		return
+	__host_trends = published
+	theme_model.call("set_trends", table)
+	# The invariant that matters, checked at the instant of applying rather than later: after taking the
+	# host's table, this machine's table must equal the one that was sent. Comparing fingerprints minutes
+	# apart proves nothing - `update_trends()` rewrites one number per theme on every month boundary, so
+	# the host's own sum legitimately differs a few seconds later. A mismatch here is a real disagreement;
+	# a difference between two later samples is just time passing.
+	# Compare the table's own contents, not the clock-derived slice.
+	#
+	# `total` sums every theme and every month, so it is a property of the table alone. The current month's
+	# slice is not: it is read from this machine's date model, and a month boundary can fall between the
+	# host building the message and the client applying it - at 6x a month is under ten seconds. Comparing
+	# it produced a warning on a healthy session whose table matched exactly ("host sent sum 2298 month
+	# 170, applying it gave sum 2298 month 222" - same sum, one month apart), which is a check failing on
+	# a machine that is right.
+	var mine = __trend_fingerprint_now()
+	if int(mine["total"]) != int(dict_lib.number(published, "total", -1)):
+		__trends_mismatch = "host sent sum %s, applying it gave sum %s" % [
+			String(int(dict_lib.number(published, "total", -1))),
+			String(int(mine["total"]))
+		]
+		coop_log.warning(config.log_name, "net: the host's trend table did not apply cleanly (%s)"
+			% [__trends_mismatch])
+	elif not __trends_applied_noted:
+		__trends_applied_noted = true
+		coop_log.info(config.log_name, "net: took the host's trend table (%s theme(s), sum %s, matches)"
+			% [String(dict_lib.number(published, "themes", 0)),
+			String(int(dict_lib.number(published, "total", 0)))])
+
+
+# The host's trend table as it goes on the wire, or null when there is nothing to send.
+func __trend_table_message():
+	if not models.has_model("game-theme"):
+		return null
+	var theme_model = models.get_model("game-theme")
+	var table = theme_model.get_data()["trends"] if theme_model.has_method("get_data") else null
+	# An empty table is not a market, it is a model that has not been built yet. Publishing it once sent
+	# "0 theme(s), sum 0" to the client before the host's own trends existed, which then had to be
+	# overwritten; a client that missed the second table would have had no trends at all.
+	if table == null or table.size() == 0:
+		return null
+	var month = int(models.get_model("date").get_date().month)
+	var total = 0
+	var this_month = 0
+	var themes = 0
+	for name in table:
+		var series = table[name]
+		if series == null:
+			continue
+		themes += 1
+		var index = 0
+		while index < series.size():
+			total += int(series[index])
+			if index == month:
+				this_month += int(series[index])
+			index += 1
+	# The fingerprint travels as well as the table, so a client can report agreement without walking the
+	# whole thing on every check, and so a mismatch is visible in a log line rather than only in behaviour.
+	return {
+		table = table,
+		themes = themes,
+		total = total,
+		month = this_month
+	}
 
 
 # ---------------------------------------------------------------------------
@@ -1533,6 +1763,10 @@ var __play_stuck = {}
 var __play_last_date = -1
 var __play_corrections = 0
 var __play_held_noted = false
+var __play_view_noted = false
+var __play_screen_since = -1.0
+var __play_gated_noted = false
+var __play_frozen_warned = false
 var __play_was_frozen = false
 var __play_their_date = -1
 var __play_frozen_noted = false
@@ -1751,6 +1985,20 @@ func __run_verify():
 		String(models.get_model("currency").get_currency()))
 	__check("own company has no console unless it earned one", company.my_consoles().size() >= 0,
 		"%s console(s)" % [String(company.my_consoles().size())])
+
+	# The theme trends are the market's opinion of each genre, re-rolled on every month boundary, and the
+	# project screen prices a genre against them. Each machine used to roll its own: `update_trends()` is
+	# connected to this machine's own date model's `month` signal in controllers/game-theme.gd:41 and
+	# generates fresh random numbers, so from the first month boundary onward two players in one world saw
+	# different markets - the same project priced differently on each screen, with nothing in the log to say
+	# so. The client no longer rolls them (see __disable_trend_simulation) and takes the host's table from
+	# the company table, so this compares the two by value.
+	var trends = __trend_fingerprint()
+	__check("the trend table is the host's", trends["ok"],
+		"%s theme(s), sum %s, month %s, %s" % [
+			String(trends["themes"]), String(trends["total"]), String(trends["month"]),
+			trends["why"]
+		])
 
 	__check("date does not run ahead of the world", date_model.get_raw_date() - __host_raw <= 1,
 		"local %s vs world %s" % [String(date_model.get_raw_date()), String(__host_raw)])
@@ -3210,6 +3458,15 @@ func __apply_clock(message):
 
 	__step("clock: pausing or resuming")
 	__pause(dict_lib.flag(message, "paused", false))
+	# The host's own freeze, followed rather than fought. A client whose clock keeps ticking while the
+	# host's screen is open advances a week and is pulled back every three seconds; matching the host's
+	# freeze here stops the stutter at its source instead of correcting it afterwards.
+	if config.role == "client" and message.has("frozen"):
+		var host_frozen = dict_lib.flag(message, "frozen", false)
+		# set_freeze takes the game's own flag, not the combined is_paused() (which is also true for
+		# force_pause and for a date model that has not started). Driving it from is_paused() would set
+		# the game's freeze flag off the wrong quantity.
+		date_model.call("set_freeze", host_frozen)
 	# The world's time, remembered so __enforce_host_clock() can hold this machine to it every frame.
 	__host_raw = dict_lib.number(message, "raw_date", __host_raw)
 	__host_speed = speed

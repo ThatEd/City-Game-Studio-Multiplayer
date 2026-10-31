@@ -580,26 +580,69 @@ static func my_games(exclude = null):
 # for a player's competitor shows up in that screen as an offer, with that player's name and logo, and can
 # be picked as a project - which is exactly the connection wanted between players, using the game's own
 # screen rather than a new one.
+#
+# The proposal has to be a *complete* game record, not a summary. The game builds these itself in
+# controllers/concurrent-game.gd `_create_trade_publish_game()` with fifteen fields; the screen and the
+# project it starts read all of them. A shorter dictionary compiles, logs and looks fine, and then the
+# first frame that reads a missing member is a native access violation at 0xae5633 - which is exactly
+# what happened the first time a released game crossed the wire: the host crashed one second after
+# `competitor coop-tester ... games_sent=1 new_games=1`, twice in a row. The screen had never been opened
+# before that, because releasing was switched off, so the incomplete record had never been read.
 static func publish_offers(player_id, games):
 	if games == null or not models.has_model("concurrent-game"):
 			return 0
 	var model = models.get_model("concurrent-game")
+	var today = models.get_model("date").get_date()
 	var proposals = []
 	for game in games:
 			if game == null or not game.has("id"):
 				continue
+			var name = String(game["name"]) if game.has("name") else String(game["id"])
+			var theme = String(game["theme"]) if game.has("theme") else ""
+			var types = game["types"] if game.has("types") and game["types"] != null else []
+			if types.size() == 0:
+				continue
+			# The royalty a publisher would pay is derived from the note, the way the game derives it: a
+			# better game is worth a bigger cut, and this is the number the offer screen displays.
+			var note = float(game["note"]) if game.has("note") else 0.0
+			note = clamp(note, 0.0, 100.0)
+			var royalties = int(round(clamp(5.0 + note / 10.0, 5.0, 15.0)))
+			var platform = String(game["platform"]) if game.has("platform") else ""
+			var platform_id = ""
+			if models.has_model("platform") and platform != "":
+				var platform_model = models.get_model("platform")
+				# The platform is carried by name in a game record, so the id is looked up from the model's
+				# own list rather than assuming an accessor that does not exist (`get_platform_by_name` is not
+				# in this build).
+				if platform_model.has_method("get_platforms"):
+					var platforms = platform_model.call("get_platforms", today, false)
+					if platforms != null:
+						for entry in platforms:
+							if entry != null and entry.has("name") and String(entry["name"]) == platform:
+								platform_id = String(entry["id"]) if entry.has("id") else ""
+								break
 			proposals.push_back({
 				id = String(game["id"]),
 				concurrent_id = String(player_id),
-				name = String(game["name"]) if game.has("name") else String(game["id"]),
-				type_list = game["types"] if game.has("types") else [],
-				theme = String(game["theme"]) if game.has("theme") else "",
-				theme_label = String(game["theme"]) if game.has("theme") else "",
-				platform = String(game["platform"]) if game.has("platform") else "",
-				platform_id = "",
-				royalties = 0.0,
-				min_score = 0,
-				note = float(game["note"]) if game.has("note") else 0.0
+				name = name,
+				online = false,
+				platform = platform,
+				platform_id = platform_id,
+				theme = theme,
+				theme_label = "LABEL_THEME_%s" % [theme.to_upper()],
+				date = game["date"] if game.has("date") else today,
+				presequel = null,
+				size = "normal",
+				size_label = "LABEL_GAME_SIZE_NORMAL",
+				type_list = types,
+				target = "all",
+				target_label = "LABEL_TARGETTED_AUDIENCE_ALL",
+				royalties = royalties,
+				minimum_note = note,
+				income = 0.0,
+				penalty = 0.0,
+				cracked = false,
+				engine_id = null
 			})
 	model.set_concurrent_proposals(String(player_id), proposals)
 	return proposals.size()

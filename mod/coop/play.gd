@@ -30,6 +30,9 @@ const ACTIONS = ["project", "office", "furnish", "research", "project2", "office
 
 const ACTION_INTERVAL = 90.0
 const CHECK_INTERVAL = 60.0
+# How long a screen the bot opened has to be up before it is closed again. See __return_to_the_world: a
+# scene torn down mid-push crashed the host at 0xae5633, twice, at roughly this delay after an action.
+const SCREEN_SETTLE_SECONDS = 4.0
 const DIGEST_INTERVAL = 5.0
 # Money drifts every tick in a running game, so an exact match would be a false alarm.
 const CURRENCY_TOLERANCE = 0.05
@@ -56,6 +59,20 @@ static func tick(coop):
 		])
 
 	var now = coop.__elapsed
+	# Whatever an action did to the game's state, the simulation has to be left able to run.
+	#
+	# `controllers/date.gd compute_state()` freezes the clock unless the game is in its plain view mode
+	# *and* `scene_manager.is_game_main_scene()` - which is `get_number_of_scene() == 0`, i.e. no popup on
+	# the stack. Starting a project makes the game open its own design screen and leaves it there, so the
+	# stack never empties, the clock freezes at week 5, nothing in `dev` can finish, and the release step
+	# has nothing to release.
+	#
+	# This was invisible for a long time because nothing reported the two conditions separately: a playtest
+	# logged "the game's own clock is frozen (the automated run never enters view mode)" for fifteen
+	# minutes while the state model *was* in view mode - the popup was the cause, and the message named the
+	# wrong one. `clock` on the remote channel now reports both.
+	if coop.config.play > 0.0:
+		__return_to_the_world(coop)
 	if now >= coop.__play_next_digest:
 		coop.__play_next_digest = now + DIGEST_INTERVAL
 		__send_digest(coop)
@@ -75,6 +92,92 @@ static func tick(coop):
 	if now >= coop.__play_deadline and not coop.__play_finished:
 		coop.__play_finished = true
 		__finish(coop)
+
+
+# Getting the game back to the world, so time can move.
+#
+# Two separate conditions freeze the clock (`controllers/date.gd compute_state()`), and the bot has to
+# satisfy both after acting: the state model has to be in view mode, and no popup may be on the scene
+# stack. `scene_manager.back()` is what the game's own Back button calls, so it is the popup-closing path
+# a player uses rather than a teardown invented here.
+static func __return_to_the_world(coop):
+	if not models.has_model("state"):
+		return
+	var state_model = models.get_model("state")
+	if state_model.has_method("is_view_mode") and not bool(state_model.call("is_view_mode")):
+		coop.__enter_view_mode()
+	var scene_manager = coop.get_tree().get_root().find_node("scene_manager", true, false)
+	if scene_manager == null or not scene_manager.has_method("get_number_of_scene"):
+		return
+	if int(scene_manager.call("get_number_of_scene")) <= 0:
+		return
+	# Not every frame, and not with force.
+	#
+	# The first version closed a screen as soon as a frame noticed one, with `back(true)`. That tears down
+	# a scene the game is still transitioning into: the host died at 0xae5633 thirty-seven seconds into a
+	# run whose projects had only just started, twice. A screen that is still being pushed is not one a
+	# player could close either. So the close waits until the same screen has been up for a moment, and
+	# uses the same non-forced `back()` the Back button uses.
+	if coop.__play_screen_since < 0.0:
+		coop.__play_screen_since = coop.__elapsed
+		return
+	if coop.__elapsed - coop.__play_screen_since < SCREEN_SETTLE_SECONDS:
+		return
+	coop.__play_screen_since = -1.0
+	var closed = bool(scene_manager.call("back", false))
+	var screens_now = 0
+	if scene_manager.has_method("get_number_of_scene"):
+		screens_now = int(scene_manager.call("get_number_of_scene"))
+	# What actually happened, not what was attempted. `back()` returns false and closes nothing when the
+	# open screen is *protected*, and the project screens all are (menu.gd passes
+	# `game_step != "kickoff"` as protect): the game requires the player to confirm them, so a bot cannot
+	# dismiss one and neither can this. Reporting "closed a game screen" while `screens` stayed at 1 was a
+	# false claim in the log for a whole pass.
+	if closed or screens_now < 1:
+		coop_log.info(coop.config.log_name, "play: closed a gated screen (view_mode=%s, %s left)" % [
+			__view_mode_text(), String(screens_now)
+		])
+	elif not coop.__play_gated_noted:
+		coop.__play_gated_noted = true
+		coop_log.info(coop.config.log_name, "play: the open screen is protected, so only a player can "
+			+ "confirm it (view_mode=%s, %s screen(s)). A studio director is the game's own way to skip "
+			% [__view_mode_text(), String(screens_now)]
+			+ "these screens; without one no week passes while a project screen is open")
+	if not coop.__play_view_noted:
+		coop.__play_view_noted = true
+
+
+static func __view_mode_text():
+	if not models.has_model("state"):
+		return "?"
+	var state_model = models.get_model("state")
+	if not state_model.has_method("is_view_mode"):
+		return "?"
+	return String(bool(state_model.call("is_view_mode")))
+
+
+# Why the clock is not moving, in one line. Called when a check finds the world stopped, so a stall
+# explains itself instead of needing a manual probe.
+static func __freeze_reason(coop):
+	var parts = []
+	if models.has_model("state"):
+		var state_model = models.get_model("state")
+		if state_model.has_method("is_view_mode"):
+			parts.push_back("view_mode=%s" % [String(bool(state_model.call("is_view_mode")))])
+	var scene_manager = coop.get_tree().get_root().find_node("scene_manager", true, false)
+	if scene_manager != null:
+		if scene_manager.has_method("get_number_of_scene"):
+			parts.push_back("screens=%s" % [String(int(scene_manager.call("get_number_of_scene")))])
+		parts.push_back("main_scene_nodes=%s" % [
+			String(coop.get_tree().get_nodes_in_group("main_scene").size())
+		])
+	if models.has_model("date"):
+		var date_model = models.get_model("date")
+		parts.push_back("paused=%s is_paused=%s started=%s" % [
+			String(bool(date_model.paused)), String(bool(date_model.call("is_paused"))),
+			String(bool(date_model.call("is_started")))
+		])
+	return company.join(parts, " ")
 
 
 static func __send_digest(coop):
@@ -327,10 +430,26 @@ static func __their_date_advanced(coop, theirs):
 # A paused world makes every other check pass for the wrong reason: two frozen machines agree about
 # everything. So the playtest refuses to call a session healthy while the clock is not running, unless
 # the pause was asked for.
+#
+# "Not running" is two different states and only one of them was checked. `paused` is the player's
+# switch; `frozen` is the game's own, set by `controllers/date.gd compute_state()` whenever the game is
+# not in its plain view mode - which it leaves for the furniture shop and studio editing. A session can
+# therefore be unpaused, frozen, and completely stopped, which is what every earlier playtest was: the
+# clock sat at week 5 for fifteen minutes while "the world is actually running, not silently paused"
+# passed, a project in `dev` never finished, and the release step had nothing to release.
 static func __world_moving(coop):
 	if coop.config.play_paused:
 		return true
-	return not bool(models.get_model("date").paused)
+	if bool(models.get_model("date").paused):
+		return false
+	if coop.__date_frozen(models.get_model("date")):
+		if not coop.__play_frozen_warned:
+			coop.__play_frozen_warned = true
+			coop_log.warning(coop.config.log_name, "play: the clock is frozen, not paused (%s)" % [
+				__freeze_reason(coop)
+			])
+		return false
+	return true
 
 
 static func __date_advanced(coop):
@@ -418,6 +537,27 @@ static func __finish(coop):
 		coop_log.info(coop.config.log_name, "play: ALL OK")
 	else:
 		coop_log.warning(coop.config.log_name, "play: PROBLEMS FOUND")
+	# The one thing no run had ever watched: a game actually leaving the company's own hands. "published"
+	# is the bucket a released game lands in, and it is what the rival feed and the publish-offer list are
+	# built from - a button that fires and spends money while the project stays in HOLD would satisfy every
+	# assertion above.
+	var catalog = models.get_model("game").get_data()["catalog"]
+	var counts = []
+	for bucket in ["dev", "hold", "published", "released", "discontinued"]:
+		var size = 0
+		if catalog.has(bucket) and catalog[bucket] != null:
+			size = catalog[bucket].size()
+		counts.push_back("%s=%s" % [bucket, String(size)])
+	coop_log.info(coop.config.log_name, "play: game catalog %s" % [company.join(counts, " ")])
+	if coop.config.play_release:
+		var published = 0
+		if catalog.has("published") and catalog["published"] != null:
+			published = catalog["published"].size()
+		if published > 0:
+			coop_log.info(coop.config.log_name, "play: a released game reached the published bucket")
+		else:
+			coop_log.warning(coop.config.log_name, "play: nothing reached the published bucket, so no "
+				+ "release actually completed")
 
 
 # --- the actions --------------------------------------------------------
@@ -471,8 +611,12 @@ static func __action_project(coop, wanted_size):
 
 	var template = __own_game_template()
 	if template == null:
+		# Name what is missing. "no usable project values" was accurate and useless: it took a manual
+		# probe to learn that a brand-new company has no default engine, because get_default_engine()
+		# returns {id, type} and a fresh company has not chosen one - so the owned list is the only source
+		# and it was being read after a null check that could never pass.
 		coop_log.warning(coop.config.log_name, "play: no usable project values yet (%s)" % [
-			"template" if template != null else "nothing released and nothing on offer"
+			__project_values_problem()
 		])
 		return false
 	var office = coop.company_id_for_office()
@@ -508,6 +652,77 @@ static func __action_project(coop, wanted_size):
 		String(data["name"]), String(wanted_size), office.substr(0, 8)
 	])
 	return true
+
+
+# Why __own_game_template() returned nothing, in the terms a reader can act on.
+static func __project_values_problem():
+	var missing = []
+	if not models.has_model("game-type"):
+		missing.push_back("no game-type model")
+	elif models.get_model("game-type").get_unlocked_game_types().size() == 0:
+		missing.push_back("no genre unlocked")
+	if not models.has_model("game-theme"):
+		missing.push_back("no game-theme model")
+	elif models.get_model("game-theme").get_theme_names().size() == 0:
+		missing.push_back("no theme")
+	var platform_controller = controllers.get_controller("platform")
+	if platform_controller == null or not platform_controller.has_method("list_platform"):
+		missing.push_back("no platform controller")
+	elif platform_controller.call("list_platform", false, true).size() == 0:
+		missing.push_back("no publishable platform")
+	if models.has_model("game-engine"):
+		var engine = models.get_model("game-engine")
+		var owned = engine.call("get_owned_engine_list") if engine.has_method("get_owned_engine_list") else null
+		var available = engine.call("get_available_engine_list") if engine.has_method("get_available_engine_list") else null
+		# A brand-new company owns no engine and has no default one: it can still start a project on a
+		# rentable engine the world already offers, which is what __first_project_values() falls back to.
+		if (owned == null or owned.size() == 0) and (available == null or available.size() == 0):
+			missing.push_back("no engine to develop on (none owned, none rentable)")
+	if missing.size() == 0:
+		return "nothing released and nothing on offer, and every project field is available"
+	var text = ""
+	for part in missing:
+		if text != "":
+			text += ", "
+		text += String(part)
+	return text
+
+
+# Creates this company's first game engine, the way the technology screen does.
+#
+# `create_engine(name, type, studio_list, features_ids, royalties)` is the game's own controller path: it
+# builds an empty engine, adds the features that cost nothing, and registers the result as owned. Only the
+# INTERNAL type is created here - a player could also buy or rent one, but an internal engine is what the
+# screen offers first and it costs the creation cost, which the playtest has.
+static func __create_engine_for_first_project():
+	if not models.has_model("game-engine"):
+		return null
+	var controller = controllers.get_controller("game-engine")
+	if controller == null or not controller.has_method("create_engine"):
+		return null
+	var engine_model = models.get_model("game-engine")
+	var office = ""
+	if models.has_model("studio"):
+		office = models.get_model("studio").get_current_studio_id() \
+			if models.get_model("studio").has_method("get_current_studio_id") else ""
+	var cost = int(engine_model.call("get_creation_cost"))
+	if int(models.get_model("currency").get_currency()) < cost:
+		coop_log.warning("coop", "play: cannot build an engine, it costs %s and this company holds %s" % [
+			String(cost), String(models.get_model("currency").get_currency())
+		])
+		return null
+	# ENGINE_TYPES.INTERNAL is 0 in scripts/models/game-engine.gd; passed as the enum's own value rather
+	# than a literal so a renumbered enum cannot silently create something else.
+	var internal = 0
+	controller.call("create_engine", "Coop Engine", internal, [office] if office != "" else [], [], 0.0)
+	var owned = engine_model.call("get_owned_engine_list")
+	if owned == null or owned.size() == 0:
+		return null
+	var engine_id = owned[owned.size() - 1].id if owned[owned.size() - 1].has("id") else null
+	if engine_id != null:
+		engine_model.call("set_default_engine", engine_id)
+		coop_log.info("coop", "play: built the company's first engine (%s)" % [String(engine_id).substr(0, 8)])
+	return engine_id
 
 
 static func __own_game_template():
@@ -566,12 +781,21 @@ static func __first_project_values():
 	var engine_id = null
 	if models.has_model("game-engine"):
 		var engine = models.get_model("game-engine")
-		if engine.has_method("get_default_engine"):
-			engine_id = engine.get_default_engine()
-		if engine_id == null:
-			var owned = engine.get_owned_engine_list()
-			if owned != null and owned.size() > 0:
-				engine_id = owned[0].id if owned[0].has("id") else null
+		# A fresh company has no default engine and owns none - the game only sets one when the project
+		# screen finishes creating an engine. So the project values fall back to a rentable engine the
+		# world already offers, which is what a player with no engine actually picks.
+		var available = engine.call("get_available_engine_list") if engine.has_method("get_available_engine_list") else null
+		if available != null:
+			for entry in available:
+				if entry != null and entry.has("id"):
+					engine_id = entry["id"]
+					break
+	if engine_id == null:
+		# A world with no engine at all - a brand-new company's first project. A player creates one on the
+		# technology screen before their first kickoff, and that is the only way this state is ever left;
+		# without it the bot could never start a project on a fresh company, which is why every earlier
+		# playtest logged "no usable project values" and then did nothing.
+		engine_id = __create_engine_for_first_project()
 	if engine_id == null:
 		return null
 

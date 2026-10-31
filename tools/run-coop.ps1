@@ -83,9 +83,17 @@ $relayLog = Join-Path $logDir "$Name-relay.log"
 # The relay appends so a restart keeps the run; a new run must not inherit the old one's lines.
 Remove-Item $relayLog -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $logDir "$Name-host.log"), (Join-Path $logDir "$Name-client.log") -ErrorAction SilentlyContinue
+# stderr is captured, and the process is hidden, for the same reason as tools/run-three.ps1: started with
+# its streams redirected, `print()` raises OSError(22) in this relay, and that exception used to leave
+# serve_forever() and kill the relay mid-session while both games stayed healthy. The relay's own log()
+# cannot raise any more, but a stray print elsewhere still could - so the output goes somewhere it can
+# succeed, and the err file is what says why a relay died if one ever does.
+$relayErr = Join-Path $logDir "$Name-relay.err.log"
+Remove-Item $relayErr -ErrorAction SilentlyContinue
 $relay = Start-Process -FilePath "python" `
     -ArgumentList @($server, "--port", "$Port", "--log", $relayLog, "--stores", $Stores) `
-    -WorkingDirectory $root -PassThru -WindowStyle Hidden
+    -WorkingDirectory $root -PassThru -WindowStyle Hidden `
+    -RedirectStandardError $relayErr
 Start-Sleep -Seconds 1
 
 $hostProc = Start-Process -FilePath $exe -ArgumentList $hostArgs -WorkingDirectory $out -PassThru

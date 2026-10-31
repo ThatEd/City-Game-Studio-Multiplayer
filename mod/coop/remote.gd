@@ -192,6 +192,10 @@ static func __run(coop, command):
 		return __date(coop, arg1, rest.strip_edges())
 	if verb == "own":
 		return __own(coop)
+	if verb == "clock":
+		return __clock(coop)
+	if verb == "trends":
+		return __trends(coop)
 	if verb == "lobby":
 		return __lobby(coop, arg1, rest.strip_edges())
 	return "unknown command [%s]; try tree, find, findall, press, fill, call, menu, menuitem, dialogs, " \
@@ -851,12 +855,133 @@ static func __own(coop):
 	if models.has_model("player"):
 		var player = models.get_model("player").get_data()
 		lines.push_back("company [%s] note %s" % [String(player.company_name), String(float(player.note))])
+	# What a project kickoff actually needs. The play bot prints "no usable project values" and says
+	# nothing about which of the four is missing, which made a fresh company look like a broken bot:
+	# `get_default_engine()` returns a *dictionary* {id, type}, not an id, so a caller that assigns it to
+	# `engine_id` compares a dictionary against null and gets null - and there is no default engine to
+	# return anyway until one is chosen, so the first project on a brand-new company needs the owned list.
+	if models.has_model("game-engine"):
+		var engine = models.get_model("game-engine")
+		var default = engine.call("get_default_engine") if engine.has_method("get_default_engine") else null
+		lines.push_back("default engine %s (type %s)" % [
+			String(dict_lib.text(default, "id", "null")),
+			String(dict_lib.text(default, "type", "-"))
+		])
+		var owned_list = engine.call("get_owned_engine_list") if engine.has_method("get_owned_engine_list") else null
+		lines.push_back("owned engine list %s" % [String(owned_list.size()) if owned_list != null else "null"])
+	if models.has_model("game-theme"):
+		var themes = models.get_model("game-theme").get_theme_names()
+		lines.push_back("themes %s (%s)" % [
+			String(themes.size()) if themes != null else "null",
+			String(themes[0]) if themes != null and themes.size() > 0 else "-"
+		])
+	var platform_controller = controllers.get_controller("platform")
+	if platform_controller != null and platform_controller.has_method("list_platform"):
+		var platforms = platform_controller.call("list_platform", false, true)
+		lines.push_back("publishable platforms %s" % [String(platforms.size()) if platforms != null else "null"])
 	return company_join(lines)
 
 
 # Everything sitting on top of the game, whatever its scene, from the root down: the Steam warning is a
 # separate scene that never joins the popup group, so a group walk alone reports "none" while a dialog
 # covers the screen.
+# Why the clock is or is not moving, in one answer.
+#
+# Four independent things can stop it and they look identical from the outside: the state model not being
+# in view mode, the scene not being the game's main scene, the date model's own pause flag, and its
+# freeze flag. A playtest sat with the world stopped at one week for fifteen minutes and each of those
+# was a plausible cause, so this reports all of them at once instead of one at a time.
+static func __clock(coop):
+	var lines = []
+	if not models.has_model("date"):
+		return "no date model"
+	var date_model = models.get_model("date")
+	var state = "?"
+	if models.has_model("state"):
+		var state_model = models.get_model("state")
+		if state_model.has_method("is_view_mode"):
+			state = String(bool(state_model.call("is_view_mode")))
+		if state_model.has_method("get_data"):
+			var data = state_model.call("get_data")
+			lines.push_back("state current=[%s] view_mode=%s" % [
+				String(dict_lib.text(data, "current_state", "?")), state
+			])
+	else:
+		lines.push_back("no state model")
+	# `scene_manager` is an autoload: in main.gd it resolves as a global identifier, but remote.gd is a
+	# different script, so it is reached through the tree instead of assumed.
+	var scene_manager = coop.get_tree().get_root().find_node("scene_manager", true, false)
+	if scene_manager == null:
+		scene_manager = coop.get_tree().get_root().get_node("scene_manager") \
+			if coop.get_tree().get_root().has_node("scene_manager") else null
+	if scene_manager != null and scene_manager.has_method("is_game_main_scene"):
+		lines.push_back("game main scene=%s" % [String(bool(scene_manager.call("is_game_main_scene")))])
+	else:
+		lines.push_back("no game main scene accessor")
+	lines.push_back("paused=%s is_paused=%s started=%s raw=%s tick=%s interval=%s speed=%s" % [
+		String(bool(date_model.paused)),
+		String(bool(date_model.call("is_paused"))),
+		String(bool(date_model.call("is_started"))),
+		String(date_model.get_raw_date()),
+		"n/a",
+		String(date_model.get_week_duration()),
+		String(date_model.get_speed_index())
+	])
+	lines.push_back("frozen (is_paused and not paused)=%s" % [String(coop.__date_frozen(date_model))])
+	return company_join(lines)
+
+
+# The theme trends, as this machine holds them.
+#
+# Trends are the market's opinion of each genre, rolled once per theme at game start and again on every
+# month boundary, and they are what the project screen prices a genre against. Two machines in one world
+# must agree on them, so this prints a stable fingerprint rather than the whole table: the sum of every
+# value plus the current month's slice. Identical fingerprints on two machines is the claim worth checking.
+static func __trends(coop):
+	if not models.has_model("game-theme"):
+		return "no game-theme model"
+	var theme_model = models.get_model("game-theme")
+	# get_data(), not call("get_trends"): the `own` verb reads every other model through get_data() and
+	# works, while this returned an empty answer with no error - `call()` on this build's model nodes is
+	# the same family of hazard the mod already documents elsewhere.
+	var data = theme_model.get_data()["trends"] if theme_model.has_method("get_data") else null
+	if data == null:
+		return "no trends"
+	var month = int(models.get_model("date").get_date().month)
+	var names = []
+	var total = 0
+	var this_month = 0
+	for name in data:
+		names.push_back(String(name))
+		var series = data[name]
+		if series == null:
+			continue
+		var index = 0
+		while index < series.size():
+			total += int(series[index])
+			if index == month:
+				this_month += int(series[index])
+			index += 1
+	names.sort()
+	var lines = []
+	lines.push_back("themes=%s month=%s sum_all=%s sum_this_month=%s" % [
+		String(names.size()), String(month), String(total), String(this_month)
+	])
+	# A few concrete values, so two machines can be compared by eye as well as by checksum.
+	var sample = []
+	var taken = 0
+	for name in names:
+		if taken >= 5:
+			break
+		var series = data[name]
+		if series == null or series.size() <= month:
+			continue
+		sample.push_back("%s=%s" % [String(name), String(int(series[month]))])
+		taken += 1
+	lines.push_back("sample %s" % [company_join(sample, " ")])
+	return company_join(lines)
+
+
 static func __dialogs(coop):
 	var lines = []
 	var root = coop.get_tree().get_root()
