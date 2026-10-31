@@ -1766,7 +1766,7 @@ var __play_held_noted = false
 var __play_view_noted = false
 var __play_screen_since = -1.0
 var __play_gated_noted = false
-var __play_screen_pressed = 0
+
 var __play_frozen_warned = false
 var __play_was_frozen = false
 var __play_their_date = -1

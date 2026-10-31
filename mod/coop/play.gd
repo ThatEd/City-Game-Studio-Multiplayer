@@ -140,12 +140,11 @@ static func __return_to_the_world(coop):
 	# Without it no week ever passed while a project screen was open: `controllers/date.gd
 	# compute_state()` freezes the clock when a screen is on the stack, so a project sat at KICKOFF forever
 	# and nothing was ever released.
-	if screens_now > 0 and closed == false and coop.__play_screen_pressed < 2:
+	if screens_now > 0 and closed == false:
 		var popups = coop.get_tree().get_nodes_in_group("popup-node")
 		if popups.size() > 0:
 			var top = popups[popups.size() - 1]
 			if top != null and top.has_method("next_pressed"):
-				coop.__play_screen_pressed += 1
 				top.call("next_pressed")
 				closed = true
 				coop_log.info(coop.config.log_name, "play: pressed Next on [%s] the way a player does, so "
@@ -570,14 +569,25 @@ static func __finish(coop):
 		counts.push_back("%s=%s" % [bucket, String(size)])
 	coop_log.info(coop.config.log_name, "play: game catalog %s" % [company.join(counts, " ")])
 	if coop.config.play_release:
-		var published = 0
-		if catalog.has("published") and catalog["published"] != null:
-			published = catalog["published"].size()
-		if published > 0:
-			coop_log.info(coop.config.log_name, "play: a released game reached the published bucket")
+		# Read the buckets as they are *now*, not when the playtest's deadline was decided: the deadline
+		# fires a moment before the last actions finish, so a release made seconds later was reported as
+		# "nothing reached the published bucket" on a run that had in fact released a game.
+		var after = models.get_model("game").get_data()["catalog"]
+		var where = []
+		for bucket in ["published", "released", "hold", "dev"]:
+			var size = 0
+			if after.has(bucket) and after[bucket] != null:
+				size = after[bucket].size()
+			where.push_back("%s=%s" % [bucket, String(size)])
+		var shipped = 0
+		for bucket in ["published", "released"]:
+			if after.has(bucket) and after[bucket] != null:
+				shipped += after[bucket].size()
+		if shipped > 0:
+			coop_log.info(coop.config.log_name, "play: a game is on sale (%s)" % [company.join(where, " ")])
 		else:
-			coop_log.warning(coop.config.log_name, "play: nothing reached the published bucket, so no "
-				+ "release actually completed")
+			coop_log.warning(coop.config.log_name, "play: no game reached published or released (%s), so "
+				% [company.join(where, " ")] + "no release completed")
 
 
 # --- the actions --------------------------------------------------------
@@ -842,14 +852,25 @@ static func __action_release(coop):
 	if not catalog.has("hold") or catalog["hold"] == null or catalog["hold"].size() == 0:
 		return false
 	var released = 0
+	# One step, not two.
+	#
+	# `HOLD -> RELEASE -> PUBLISH` looks like two steps in TRANSITIONS, and stepping twice looked right.
+	# It is not: `game_update()` sets `last_step_validated` and the RELEASE state's own handler calls
+	# `release(game_data)`, which calls `specific_game_model.release_game()` - and *that* is what moves the
+	# game into the released bucket. A second `step()` made in the same frame arrives while the first is
+	# still unvalidated, so the transition is skipped and the game settles back into HOLD. Two releases were
+	# logged, `published` stayed at 0, and the other machine saw `games_sent=0` forever.
+	#
+	# So the release is one step, and the game finishes it on its own. Anything still in HOLD afterwards was
+	# not releasable this week and is left for the next attempt.
 	for game_id in catalog["hold"].keys():
 		var game = catalog["hold"][game_id]
 		if game == null:
 			continue
-		game_controller.step(game, 0)   # HOLD -> RELEASE
-		game_controller.step(game, 0)   # RELEASE -> PUBLISH
+		game_controller.step(game, 0)   # HOLD -> RELEASE; the controller then releases it
 		released += 1
-		coop_log.info(coop.config.log_name, "play: released and put [%s] on sale" % [String(game["name"])])
+		coop_log.info(coop.config.log_name, "play: released [%s] through the game's own release step"
+			% [String(game["name"])])
 	return released > 0
 
 

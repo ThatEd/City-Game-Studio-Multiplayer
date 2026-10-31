@@ -564,9 +564,24 @@ static func my_games(exclude = null):
 			entry["platform"] = ""
 			if game.has("platform"):
 				entry["platform"] = String(game["platform"])
+			# The platform *id*, not only its name. The rival sales pass does
+			# `platform_model.get_unit_sold(game_published.platform_id)` and
+			# `get_amount_of_games_released(game_published.platform_id)`, and both dereference
+			# `get_platform_by_id(id)` with no null check - so an empty id kills the receiving machine with
+			# 0xc0000005 at 0xae5633 on the first monthly sales pass after a released game arrives. That is
+			# the blocker this pass was written to clear: it took a released game crossing the wire, which
+			# no run had managed before.
+			entry["platform_id"] = ""
+			if game.has("platform_id"):
+				entry["platform_id"] = String(game["platform_id"])
 			# The trade screen builds its rows from these two, so they travel with the offer.
 			entry["types"] = game["type_list"] if game.has("type_list") else []
 			entry["theme"] = String(game["theme"]) if game.has("theme") else ""
+			entry["cycle"] = 1
+			if game.has("cycle"):
+				entry["cycle"] = int(game["cycle"])
+			# `computed_note` is what the sales pass reads; `note` is what the offer screen shows.
+			entry["computed_note"] = float(entry["note"])
 			if game.has("release_date"):
 				entry["date"] = game["release_date"]
 			games.push_back(entry)
@@ -607,12 +622,13 @@ static func publish_offers(player_id, games):
 			note = clamp(note, 0.0, 100.0)
 			var royalties = int(round(clamp(5.0 + note / 10.0, 5.0, 15.0)))
 			var platform = String(game["platform"]) if game.has("platform") else ""
-			var platform_id = ""
-			# Left empty on purpose. The platform a game was made for is carried by *name* here, the id is
-			# not needed by the offer screen, and the lookup that used to be here - a method call by name
-			# on the platform model - is the pattern this build dies on (0xc0000005 at 0xae5633, a null
-			# member read). A game crossing the wire crashed the receiving machine one second after
-			# `new_games=1` printed, and this was the first code to touch it.
+			# The platform id travels when the other machine sent one this world can resolve, because the
+			# sales pass needs a resolvable id and cannot cope without one. A *chosen* offer like this one
+			# never reaches that pass until somebody accepts it, but sending an id that cannot resolve
+			# would be handing over the same fault the transplant side just had to repair.
+			var platform_id = String(game["platform_id"]) if game.has("platform_id") else ""
+			if platform_id != "" and not __platform_known(platform_id):
+				platform_id = ""
 			proposals.push_back({
 				id = String(game["id"]),
 				concurrent_id = String(player_id),
@@ -773,6 +789,56 @@ static func theme_known(name):
 	if trends == null or typeof(trends) != TYPE_DICTIONARY:
 		return false
 	return trends.has(String(name))
+
+
+# A theme key this world's trend table actually holds, or "" if it holds none.
+static func __first_known_theme():
+	if not models.has_model("game-theme"):
+		return ""
+	var model = models.get_model("game-theme")
+	if not model.has_method("get_data"):
+		return ""
+	var data = model.get_data()
+	if data == null or typeof(data) != TYPE_DICTIONARY or not data.has("trends"):
+		return ""
+	var trends = data["trends"]
+	if trends == null or typeof(trends) != TYPE_DICTIONARY:
+		return ""
+	for name in trends:
+		# `get_trend_by_theme` also indexes a twelve-entry series, so a key with no series is no better
+		# than a missing one.
+		var series = trends[name]
+		if series != null and series.size() > 0:
+			return String(name)
+	return ""
+
+
+# Is this a platform id this machine can resolve? `get_platform_by_id` returning null is what kills the
+# sales pass, so the question is asked before the id is used rather than after.
+static func __platform_known(platform_id):
+	if platform_id == "" or not models.has_model("platform"):
+		return false
+	var model = models.get_model("platform")
+	if not model.has_method("get_platform_by_id"):
+		return false
+	# Called directly rather than through call(): a method called by name on these model nodes returns
+	# nothing on this build, which would make every platform look unknown.
+	var found = model.get_platform_by_id(String(platform_id))
+	return found != null
+
+
+# The first platform id this machine can resolve, or "".
+static func __first_known_platform():
+	if not models.has_model("platform"):
+		return ""
+	var model = models.get_model("platform")
+	var date = models.get_model("date").get_date()
+	if not model.has_method("get_platforms"):
+		return ""
+	for entry in model.get_platforms(date, false):
+		if entry != null and entry.has("id"):
+			return String(entry["id"])
+	return ""
 
 
 # The player's own game consoles, as data. Everything the player released or discontinued.
@@ -1241,6 +1307,26 @@ static func sync_games(slot, company, known = null):
 		var platform = ""
 		if game.has("platform"):
 			platform = String(game["platform"])
+		# The platform id, because the sales pass needs it and cannot cope without one.
+		#
+		# `_compute_game_sale()` calls
+		#   platform_model.get_unit_sold(game_published.platform_id)            -> get_platform_by_id(id).current_unit_sold
+		#   platform_model.get_amount_of_games_released(...platform_id)         -> get_platform_by_id(id).has(...)
+		# and neither checks for null, so an id this machine does not have is an instant 0xc0000005 at
+		# 0xae5633. The record used to send "" here. The other player's id is used when this world has it;
+		# otherwise the first platform this world can name, which is enough for the arithmetic to be real.
+		var platform_id = ""
+		if game.has("platform_id"):
+			platform_id = String(game["platform_id"])
+		if platform_id == "" or not __platform_known(platform_id):
+			var substitute = __first_known_platform()
+			if substitute != "":
+				coop_log.info("coop", "net: [%s] arrived with platform id [%s] that this world does not "
+					% [name, platform_id] + "know; using [%s]" % [substitute])
+				platform_id = substitute
+			elif platform_id == "":
+				coop_log.warning("coop", "net: [%s] has no platform id and this world can name none, so its "
+					% [name] + "sales cannot be simulated here")
 		var released = date
 		if game.has("date"):
 			released = game["date"]
@@ -1248,20 +1334,28 @@ static func sync_games(slot, company, known = null):
 		# The theme the other player's game was made with must exist in THIS machine's trend table.
 		#
 		# `game_theme_model.get_trend_by_theme(name)` indexes `__trend_data[name]` without checking, and
-		# `__trend_data` is per save - it holds the themes that save was created with. A client that picks
-		# a theme this world has no entry for therefore takes the host down as soon as
-		# `_compute_game_sale()` runs over the transplanted game: the failed index leaves it returning
-		# null, `compute_sales()` reads `data.generated_fanbase` off that null, and the process dies with
-		# 0xc0000005 at 0xae5633. That is the "host crashes when a player creates a game" report, and it
-		# reproduced on the second week after the client's project appeared.
+		# `__trend_data` is per save - it holds the themes that save was created with, and nothing else.
+		# An index that misses returns null, `_compute_game_sale()` reads `.trend` off that null, and the
+		# process dies with 0xc0000005 at 0xae5633 on the first monthly sales pass.
 		#
-		# So the theme travels only when this machine already knows it; otherwise the game is transplanted
-		# without one and the game's own trend maths stays on the neutral path.
+		# Sending no theme at all does not help: a record with `theme = ""` still looks up `__trend_data[""]`,
+		# which can never exist. Observed as a released game crossing the wire and killing the receiving
+		# machine one second later, four times - after a whole pass had assumed an empty theme "stays on
+		# the neutral path", a path this build does not have. The fix is to substitute a theme the world
+		# *does* know, so the arithmetic is real rather than skipped.
 		var theme = ""
 		var theme_label = ""
 		if game.has("theme") and theme_known(String(game["theme"])):
 			theme = String(game["theme"])
 			theme_label = String(game["theme_label"]) if game.has("theme_label") else theme
+		else:
+			var fallback = __first_known_theme()
+			if fallback != "":
+				theme = fallback
+				theme_label = fallback
+				coop_log.info("coop", "net: [%s] arrived with theme [%s] that this world does not know; "
+					% [name, String(game["theme"]) if game.has("theme") else ""]
+					+ "using [%s] so the sales pass has a real trend" % [fallback])
 		var types = []
 		if game.has("types") and typeof(game["types"]) == TYPE_ARRAY:
 			types = [] + game["types"]
@@ -1271,7 +1365,7 @@ static func sync_games(slot, company, known = null):
 			concurrent_id = slot,
 			name = name,
 			platform = platform,
-			platform_id = "",
+			platform_id = platform_id,
 			theme = theme,
 			theme_label = theme_label,
 			release_date = released,

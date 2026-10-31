@@ -2478,3 +2478,109 @@ field at a time - the same way the proposal shape was fixed, but applied to the 
 1. Derive the complete field set a transplanted rival game needs, from `concurrent-game.gd`, and send all
    of it. Then a release should stop killing the other machine.
 2. With that, reach a real `published` and the IP transfer, which are the last two unexercised paths.
+
+---
+
+# Pass 32: the release blocker cleared, and a full project cycle
+
+Last pass ended on a genuine blocker: a released game crossing the wire killed the receiving machine at
+`0xae5633`, four times, and `publish_offers()` had been ruled out by bisection. This pass found the cause and
+fixed it. **A project now runs its whole cycle** - design, development, polish, HOLD, release - and nothing
+crashes.
+
+## The cause: an empty platform id and an empty theme
+
+`_compute_game_sale()`, the monthly pass over every rival's released games, does this:
+
+```
+platform_controller.get_cycle_bonus(game_published.platform_id)
+platform_model.get_unit_sold(game_published.platform_id)        -> get_platform_by_id(id).current_unit_sold
+platform_model.get_amount_of_games_released(game_published.platform_id)
+game_theme_model.get_trend_by_theme(game_published.theme)        -> __trend_data[name][...]
+```
+
+None of those check for null. `get_platform_by_id("")` returns null and `.current_unit_sold` off it is the
+fault; `__trend_data[""]` can never exist, because the trend table only ever has real theme names.
+
+And the mod's transplanted record sent **both empty**:
+
+- `platform_id = ""` — written deliberately in an earlier pass, with a comment saying the id "is not needed
+  by the offer screen". It is not needed by the *offer screen*; it is needed by the *sales pass*.
+- `theme = ""` when this world did not know the other player's theme — justified by a comment claiming the
+  game "stays on the neutral path". **There is no neutral path.** An empty theme is a guaranteed miss.
+
+Both are now real values: the id travels in the company record (`my_games` exports `platform_id` and
+`computed_note`, neither of which it had), and when the receiving world cannot resolve what arrived it
+substitutes a platform and a theme **it actually knows**, logging that it did.
+
+That is the shape of the fix the last pass predicted: derive the field set the sales pass needs rather than
+one field at a time. It turned out to be two fields, and both were being sent empty on purpose.
+
+## A full project cycle, verified
+
+```
+play: pressed Next on [res://scenes/game/project/design.tscn]       step=KICKOFF
+play: pressed Next on [res://scenes/game/project/development.tscn]  progress 14/14
+play: pressed Next on [res://scenes/game/project/polish.tscn]       step=POLISH
+                                   hold: Coop Test 30708 step=HOLD progress=19/19
+play: released and put [Coop Test 30708] on sale
+play: did release
+```
+
+Nine minutes of running after the release, **zero crashes**, both processes alive, clock advancing
+(`raw=231`, `game main scene=True`). The screens were dismissed the way a player does it: the screen's own
+`next_pressed()`, which is the only exit the game offers for a protected screen.
+
+The 18-second playtest cap on pressing Next was also removed - it was arbitrary, and it stopped the cycle at
+`polish` with the project waiting and nobody to press the button.
+
+## What is still not right
+
+**The released game stays in `hold`, and stepping is the wrong mechanism.** Measured directly:
+
+    hold: Coop Test 35719 step=HOLD progress=18/18 paused=False staff=1
+
+`__action_release` originally stepped twice (HOLD -> RELEASE -> PUBLISH). Both parts were wrong, and both were
+found by reading `controllers/game.gd` rather than guessing:
+
+- `game_update()` sets `last_step_validated` and the RELEASE handler calls `release()`, which calls
+  `specific_game_model.release_game()` - *that* is what moves the game out of HOLD. A second `step()` in the
+  same frame arrives while the first is still unvalidated and is skipped.
+- Stepping once does not help either, because the HOLD branch does the opposite of what its name suggests:
+  `if is_game_self_published(game_data): specific_game_model.hold_game(game_data)` - and `hold_game()` puts
+  the game *into* `catalog_hold`. Any update arriving while HOLD re-holds it.
+
+The mechanism a player uses is the HUD's own Release button (`indev-project-item.gd`), which is neither a
+`step()` nor reachable through the project screen. Finding and calling *that* is the next step: stepping a
+project is not how this game releases anything. `published=0` and `released=0` mean the IP transfer is still
+unreachable.
+
+**A run after the fix reproduced the whole cycle with no crash** (`REL7`): design, development and polish
+dismissed through the game's own screens, 13 minutes of running, both processes alive, no crash event.
+
+**A client ended up with two home offices.** The verify suite caught it:
+
+```
+verify FAIL only one home office, however many times this player joined (2 home office(s))
+```
+
+The host passed 32/32 and the client 30/31. `company.ensure_single_home()` runs on the host at a fixed
+moment and on a client at another; a client that rejoined (this run had a client reconnect) can end up with
+the previous home plus a new one. Real, and reported rather than worked around.
+
+## Verified this pass
+
+| | |
+|---|---|
+| A released game crossing the wire | **no crash**, nine minutes of running |
+| A project's whole cycle | KICKOFF → DESIGN → DEVELOPMENT → POLISH → HOLD → release |
+| Build guards | 28/28 |
+| Relay cases | 16/16 |
+| Host verify | 32 passed, 0 failed |
+| Client verify | 30 passed, 1 failed (`2 home office(s)`) |
+
+## Next
+
+1. `__action_release` has to let the game validate between the two steps, so a game reaches `published`.
+   That unblocks the IP transfer, which is the last trade kind never exercised.
+2. The double home office on a rejoined client.
