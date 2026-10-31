@@ -1765,6 +1765,8 @@ var __play_corrections = 0
 var __play_held_noted = false
 var __play_view_noted = false
 var __play_screen_since = -1.0
+# When to collapse this client's home offices down to one, or -1 for never. See __finish_join.
+var __single_home_at = -1.0
 var __play_gated_noted = false
 
 var __play_frozen_warned = false
@@ -2440,6 +2442,25 @@ func __tick_takeover_reseat():
 		return
 	__takeover_reseat_done = true
 	company.reseat_after_takeover()
+
+
+# Collapses this client's home offices down to one, once the game's own studio placement has settled.
+#
+# A client never did this before, so a save that already held a home office plus the one its join opened
+# left two. The host does the same clean-up at two points; this is the client's equivalent, deferred because
+# `open_first_studio` registers a studio as part of a call and the studio model has not caught up
+# immediately afterwards.
+func __tick_single_home():
+	if __single_home_at < 0.0 or __elapsed < __single_home_at:
+		return
+	__single_home_at = -1.0
+	var before = company.home_office_count()
+	if before <= 1:
+		return
+	var closed = company.ensure_single_home("")
+	coop_log.info(config.log_name, "office: client clean-up closed %s, %s home office(s) left" % [
+		String(closed), String(company.home_office_count())
+	])
 
 
 # Whether this run skips the lobby.
@@ -4079,6 +4100,18 @@ func __finish_join():
 	# reported "no office of ours to seat anyone in" and every employee stayed an orphan.
 	if wanted != "" and wanted != "new":
 		__takeover_reseat_at = __elapsed + 2.0
+	elif __restore != null:
+		__takeover_reseat_at = __elapsed + 2.0
+
+	# One home office per player, on a client too.
+	#
+	# The host has always done this (twice: at the selftest and again after the game has opened its own
+	# first studio), but a client never did - so a client whose save already held a home office, and whose
+	# join then opened another, ended up with two. The verify suite caught it and kept catching it:
+	#   verify FAIL only one home office, however many times this player joined (2 home office(s))
+	# Deferred for the same reason the reseat above is: the game places a studio as part of a call and the
+	# studio model has not caught up immediately afterwards, so collapsing inline would see the old state.
+	__single_home_at = __elapsed + 3.0
 
 	# The client runs its own company, so its clock must run too - but at the host's speed and
 	# following the host's date, which __apply_clock keeps aligned.
@@ -4598,6 +4631,7 @@ func _process(delta):
 	__tick_tutorial()
 	__tick_world_save_id()
 	__tick_takeover_reseat()
+	__tick_single_home()
 	__keep_lobby_on_top()
 	__trace("lobbytop")
 	__install_buyout_guard()

@@ -586,8 +586,14 @@ static func __finish(coop):
 		if shipped > 0:
 			coop_log.info(coop.config.log_name, "play: a game is on sale (%s)" % [company.join(where, " ")])
 		else:
-			coop_log.warning(coop.config.log_name, "play: no game reached published or released (%s), so "
-				% [company.join(where, " ")] + "no release completed")
+			# Not merely "no release completed": if a game is still in `hold` at this point, the release was
+			# attempted and put it back, which is a different fault from never reaching HOLD at all.
+			var stuck = 0
+			if after.has("hold") and after["hold"] != null:
+				stuck = after["hold"].size()
+			coop_log.warning(coop.config.log_name, "play: no game reached published or released (%s)%s"
+				% [company.join(where, " "),
+				"; a game was in hold and the release put it back" if stuck > 0 else ""])
 
 
 # --- the actions --------------------------------------------------------
@@ -852,25 +858,26 @@ static func __action_release(coop):
 	if not catalog.has("hold") or catalog["hold"] == null or catalog["hold"].size() == 0:
 		return false
 	var released = 0
-	# One step, not two.
+	# `next_state()`, not `step()`.
 	#
-	# `HOLD -> RELEASE -> PUBLISH` looks like two steps in TRANSITIONS, and stepping twice looked right.
-	# It is not: `game_update()` sets `last_step_validated` and the RELEASE state's own handler calls
-	# `release(game_data)`, which calls `specific_game_model.release_game()` - and *that* is what moves the
-	# game into the released bucket. A second `step()` made in the same frame arrives while the first is
-	# still unvalidated, so the transition is skipped and the game settles back into HOLD. Two releases were
-	# logged, `published` stayed at 0, and the other machine saw `games_sent=0` forever.
+	# The HUD's own Release button is wired straight to this:
+	#   release_button.connect("pressed", game_controller, "next_state", [current_data], CONNECT_ONESHOT)
+	# (src/scripts/game/indev/indev-project-item.gd:167). `next_state()` moves HOLD -> RELEASE and marks the
+	# step unvalidated; the RELEASE state's handler then calls `release()`, which calls
+	# `specific_game_model.release_game()` and is what actually puts the game in the released bucket.
 	#
-	# So the release is one step, and the game finishes it on its own. Anything still in HOLD afterwards was
-	# not releasable this week and is left for the next attempt.
+	# `step(game, 0)` looks equivalent and is not: it calls `game_update()` immediately, and at HOLD that
+	# runs `if is_game_self_published(game_data): specific_game_model.hold_game(game_data)` - which puts the
+	# game straight back into `catalog_hold`. That is why two "released" log lines produced `published=0`
+	# and `released=0` and the game sat in HOLD at progress 18/18, forever.
 	for game_id in catalog["hold"].keys():
 		var game = catalog["hold"][game_id]
 		if game == null:
 			continue
-		game_controller.step(game, 0)   # HOLD -> RELEASE; the controller then releases it
+		game_controller.next_state(game)
 		released += 1
-		coop_log.info(coop.config.log_name, "play: released [%s] through the game's own release step"
-			% [String(game["name"])])
+		coop_log.info(coop.config.log_name, "play: pressed Release on [%s], as the project card's own "
+			% [String(game["name"])] + "button does")
 	return released > 0
 
 

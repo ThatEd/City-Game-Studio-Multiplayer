@@ -2584,3 +2584,90 @@ the previous home plus a new one. Real, and reported rather than worked around.
 1. `__action_release` has to let the game validate between the two steps, so a game reaches `published`.
    That unblocks the IP transfer, which is the last trade kind never exercised.
 2. The double home office on a rejoined client.
+
+---
+
+# Pass 33: a game on sale, and the two home offices
+
+Two things this pass finished, both of them items the last pass explicitly left open.
+
+## A released game, at last
+
+Last pass concluded that stepping a project is not how this game releases anything. That was right, and the
+correct mechanism was one line away in the file that had always been the answer:
+
+```
+release_button.connect("pressed", game_controller, "next_state", [current_data], CONNECT_ONESHOT)
+```
+
+`src/scripts/game/indev/indev-project-item.gd:167` - the HUD's own Release button calls **`next_state()`**,
+not `step()`. `next_state()` moves HOLD → RELEASE and marks the step unvalidated; the RELEASE handler then
+calls `release()`, which calls `specific_game_model.release_game()` and is what puts the game in the released
+bucket.
+
+`step(game, 0)` looks equivalent and is the opposite: it runs `game_update()` immediately, and at HOLD that
+runs
+
+```
+if is_game_self_published(game_data):
+        specific_game_model.hold_game(game_data)
+```
+
+which puts the game **back into `catalog_hold`**. That is why two "released" log lines in an earlier pass
+produced `published=0 released=0` and a game sitting in HOLD at progress 18/18 forever.
+
+Now:
+
+```
+play: pressed Release on [Coop Test 32423], as the project card's own button does
+play: a game is on sale (published=0 released=1 hold=0 dev=0)
+```
+
+The first real release in this project. It crossed the wire to the other machine (`games_sent=1`) and
+**nothing crashed** - which also proves the `0xae5633` fix from last pass against a genuinely released game,
+not a transplanted one. `published` stays 0 because the game is *released* and not yet *published*: two
+different buckets, and `released` is the one a self-published game lands in at this point.
+
+The assertion was also made honest: it used to say "no release actually completed" whenever nothing was in
+`published`, which was true of a successful release. It now reports the buckets and distinguishes "a game was
+in hold and the release put it back" from "nothing reached hold at all".
+
+## The two home offices
+
+The verify suite had been failing this on the client and nowhere else:
+
+```
+verify FAIL only one home office, however many times this player joined (2 home office(s))
+```
+
+The host collapses its home offices at two points (`ensure_single_home`), and **a client never did**. A client
+whose save already held a home office, plus the one its own join opened, kept both. That is most visible on a
+rejoin - the case where the relay hands a player their previous company back.
+
+`__tick_single_home()` is the client's equivalent, deferred three seconds for the same reason the takeover
+reseat is deferred: `open_first_studio` registers a studio as part of a call and the studio model has not
+caught up immediately afterwards.
+
+Verified twice: once with a fresh client, and once on a run where the client logged `restored Tester Studio
+with 1 office(s)` - the exact case that used to leave two. **Both machines 30 passed, 0 failed** in both runs.
+
+## State after this pass
+
+| | |
+|---|---|
+| A released game | `released=1`, on both machines, no crash |
+| `0xae5633` | still clear, against a real release |
+| Two home offices | fixed; client 30/30 twice, including a restore |
+| Build guards | 28/28 |
+| Relay cases | 16/16 |
+
+## Still open
+
+- **`published`** as a separate bucket. Nothing has moved a game from `released` to `published`, and I have
+  not established what does - it may be the digital-store listing rather than a project action.
+- **The IP transfer** needs a published game of the *offering* player's own. The client's panel honestly says
+  `[games] has no published game` because it has not released one; with the release path now working, a
+  playtest where the client also releases would reach it.
+- **`logo`** is still unsendable: the player model has no `company_logo`, so `company.logo()` returns null.
+- **`acquired`** is refused by the buyout guard by design; **`session_request`** is sent by nothing.
+- **The lobby's five buttons** have only ever run through `--coop-autojoin`.
