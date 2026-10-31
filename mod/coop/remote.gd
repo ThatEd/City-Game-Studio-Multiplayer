@@ -594,10 +594,25 @@ static func __state(coop):
 				continue
 			for game_id in catalog[bucket]:
 				var game = catalog[bucket][game_id]
-				if game != null and game.has("name"):
-					lines.push_back("  %s: %s step=%s" % [
-						bucket, String(game["name"]), String(game["step"])
-					])
+				if game == null or not game.has("name"):
+					continue
+				# The numbers that decide whether a project can advance at all. `progress` only moves when a
+				# developer is working (controllers/game.gd update_in_dev pauses the game and skips the
+				# increment when no studio in `studio_list` is working), so a project sitting in `dev`
+				# forever is either unpaused-workable or has no staff, and the old one-line report could
+				# not tell those apart.
+				var paused_text = "?"
+				if game.has("paused"):
+					paused_text = String(bool(game["paused"]))
+				var staff = "?"
+				if game.has("studio_list") and game["studio_list"] != null:
+					staff = String(game["studio_list"].size())
+				lines.push_back("  %s: %s step=%s progress=%s/%s paused=%s staff=%s" % [
+					bucket, String(game["name"]), String(game["step"]),
+					String(int(dict_lib.number(game, "progress", -1))),
+					String(int(dict_lib.number(game, "game_duration", -1))),
+					paused_text, staff
+				])
 	lines.push_back("other players %s" % [String(coop.ui_other_players().size())])
 	for other in coop.ui_other_players():
 		lines.push_back("  %s  %s" % [String(other), coop.ui_player_name(other)])

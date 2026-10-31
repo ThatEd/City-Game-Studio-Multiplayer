@@ -592,7 +592,6 @@ static func publish_offers(player_id, games):
 	if games == null or not models.has_model("concurrent-game"):
 			return 0
 	var model = models.get_model("concurrent-game")
-	var today = models.get_model("date").get_date()
 	var proposals = []
 	for game in games:
 			if game == null or not game.has("id"):
@@ -609,18 +608,11 @@ static func publish_offers(player_id, games):
 			var royalties = int(round(clamp(5.0 + note / 10.0, 5.0, 15.0)))
 			var platform = String(game["platform"]) if game.has("platform") else ""
 			var platform_id = ""
-			if models.has_model("platform") and platform != "":
-				var platform_model = models.get_model("platform")
-				# The platform is carried by name in a game record, so the id is looked up from the model's
-				# own list rather than assuming an accessor that does not exist (`get_platform_by_name` is not
-				# in this build).
-				if platform_model.has_method("get_platforms"):
-					var platforms = platform_model.call("get_platforms", today, false)
-					if platforms != null:
-						for entry in platforms:
-							if entry != null and entry.has("name") and String(entry["name"]) == platform:
-								platform_id = String(entry["id"]) if entry.has("id") else ""
-								break
+			# Left empty on purpose. The platform a game was made for is carried by *name* here, the id is
+			# not needed by the offer screen, and the lookup that used to be here - a method call by name
+			# on the platform model - is the pattern this build dies on (0xc0000005 at 0xae5633, a null
+			# member read). A game crossing the wire crashed the receiving machine one second after
+			# `new_games=1` printed, and this was the first code to touch it.
 			proposals.push_back({
 				id = String(game["id"]),
 				concurrent_id = String(player_id),
@@ -630,7 +622,7 @@ static func publish_offers(player_id, games):
 				platform_id = platform_id,
 				theme = theme,
 				theme_label = "LABEL_THEME_%s" % [theme.to_upper()],
-				date = game["date"] if game.has("date") else today,
+				date = game["date"] if game.has("date") else null,
 				presequel = null,
 				size = "normal",
 				size_label = "LABEL_GAME_SIZE_NORMAL",
@@ -768,9 +760,16 @@ static func theme_known(name):
 	if not models.has_model("game-theme"):
 		return false
 	var model = models.get_model("game-theme")
-	if not model.has_method("get_trends"):
+	# get_data()["trends"], not call("get_trends"): calling a method by name on this build's model nodes
+	# returns nothing. A `trends` of null here made every theme look unknown, so nothing was ever given a
+	# theme and the neutral path was used even when the theme did exist - the guard was inert, which is the
+	# failure it was written to prevent.
+	if not model.has_method("get_data"):
 		return false
-	var trends = model.call("get_trends")
+	var data = model.get_data()
+	if data == null or typeof(data) != TYPE_DICTIONARY or not data.has("trends"):
+		return false
+	var trends = data["trends"]
 	if trends == null or typeof(trends) != TYPE_DICTIONARY:
 		return false
 	return trends.has(String(name))

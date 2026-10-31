@@ -75,7 +75,9 @@ if ($PlayRelease) {
     $clientArgs += "--coop-play-release"
 }
 
-$hostProc = Start-Process -FilePath $exe -ArgumentList $hostArgs -WorkingDirectory $out -PassThru
+$hostErr = Join-Path $logDir "$Name-host.err.log"
+Remove-Item $hostErr -ErrorAction SilentlyContinue
+$hostProc = Start-Process -FilePath $exe -ArgumentList $hostArgs -WorkingDirectory $out -PassThru -RedirectStandardError $hostErr
 $hostLog = Join-Path $logDir "$Name-host.log"
 $deadline = (Get-Date).AddSeconds(360)
 while ((Get-Date) -lt $deadline) {
@@ -92,7 +94,9 @@ while ((Get-Date) -lt $rdl) {
 }
 Start-Sleep -Seconds 3
 
-$clientProc = Start-Process -FilePath $exe -ArgumentList $clientArgs -WorkingDirectory $out -PassThru
+$clientErr = Join-Path $logDir "$Name-client.err.log"
+Remove-Item $clientErr -ErrorAction SilentlyContinue
+$clientProc = Start-Process -FilePath $exe -ArgumentList $clientArgs -WorkingDirectory $out -PassThru -RedirectStandardError $clientErr
 
 $hostProc.Id | Set-Content (Join-Path $out "pid-$Name-host.txt")
 $clientProc.Id | Set-Content (Join-Path $out "pid-$Name-client.txt")

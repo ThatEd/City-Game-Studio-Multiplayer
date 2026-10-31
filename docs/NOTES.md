@@ -2371,3 +2371,110 @@ command that produces no answer now says so by name, which is what turned both f
 - **`logo`.** Still never sent: the player model has no `company_logo`, so there is nothing to send.
 - **`acquired`.** Refused by the buyout guard, by design.
 - **`session_request`.** Handled, sent by nothing.
+
+---
+
+# Pass 31: a real release, and the blocker it exposed
+
+The remaining gaps had one root cause between them: **no project had ever completed**. Without a released
+game there is nothing to give as IP, nothing to reach `published`, and nothing to prove the playtest can
+drive the game's own project cycle.
+
+Getting that far needed two fixes and then hit a genuine blocker.
+
+## A parse error that left the mod running old code
+
+A diagnostic added to the `state` verb used `(game["studio_list"] as Array).size()`. `as` casts do not
+exist in this build. What happened next is the interesting part:
+
+```
+ERROR: GDScript::reload: Parse Error: Expected ')' in expression
+          At: res://coop/remote.gd:612
+```
+
+- The **build passed.** The pack was written, the MD5s verified, the guards green.
+- Both game instances **failed to start normally** and only wrote `verify: never ran (models=False
+  host_raw=-1)` in their own logs.
+- The cause was visible only in **stderr**, which the run scripts were not capturing.
+
+So `tools/run-coverage.ps1` now redirects both instances' stderr to `<run>-host.err.log` and
+`<run>-client.err.log`, and `check_native_killers()` refuses `as` casts with the reason spelled out: a
+parse error does not fail the build here, it leaves the previous version of the script running, so the mod
+looks healthy while the edit is ignored. That is the same class of failure as the relay that died from its
+own log line, and it cost two runs to find.
+
+The guard is proven in both directions, and the suite is now **28/28**.
+
+## The design screen could not be dismissed, so no project could finish
+
+`controllers/date.gd compute_state()` freezes the clock unless the state model is in view mode **and** no
+screen is on the scene stack. Starting a project opens `scenes/game/project/design.tscn` and leaves it
+there, so:
+
+```
+dev: Coop Test 33571 step=KICKOFF progress=0/1 paused=? staff=1
+```
+
+A project that never advances a single week. `scene_manager.back()` refuses those screens because they are
+*protected*, and forcing it is what crashed the host at `0xae5633` in an earlier pass.
+
+A player gets out by pressing the screen's own **Next** button, which calls `next_pressed()`: that steps
+the game and closes the screen. The playtest now calls exactly that —
+
+```
+play: pressed Next on [res://scenes/game/project/design.tscn] the way a player does, so the clock can run again
+```
+
+— and the project advances.
+
+## Then the blocker
+
+With the project advancing, a game finally crossed the wire. One second after the receiving machine
+logged it, that machine died:
+
+```
+[15:59:25] net: competitor coop-tester is [Tester Studio] offices=1 games_sent=1 new_games=1
+                                                            ... 2 seconds later ...
+CRASH 15:59:27 0x0000000000ae5633
+```
+
+Reproduced **four times**, same offset, same sequence. What has been ruled out, by bisection rather than
+by argument:
+
+| Suspect | Result |
+|---|---|
+| `company.publish_offers()` building the offer list | **Ruled out** - disabled entirely (`var offers = 0 if true else ...`), rebuilt, and the crash still happened at the same offset one second after `new_games=1` |
+| A method call by name on the platform model (`call("get_platforms", ...)`) inside `publish_offers` | Removed anyway, because it is the pattern this build dies on, but it is not the cause |
+| `theme_known()` using `call("get_trends")` | Fixed to read `get_data()["trends"]`. The guard had been **inert** - `call()` returned nothing on this build's model nodes, so every theme looked unknown and the neutral path was used even when the theme existed. Not the cause of this crash |
+
+`0xae5633` is `cmp esi, dword ptr [rdi + 0x38]` with `rdi` null, i.e. a Variant member read off a null
+that a failed lookup returned. The sequence is: `concurrent-game.gd` `release_game()` stores the
+transplanted game into the rival's catalog, and the game's own per-month pass later walks
+`get_released_games(concurrent_id)` and reads members off it -
+`game_data.computed_note` at line 215, for example. The record the mod transplants carries the fields the
+**offer screen** needs; it does not carry everything the **sales simulation** reads, and a missing member
+here is fatal rather than fatal-to-that-field.
+
+That is where this pass stops, deliberately. The next step is to derive the full field set from
+`concurrent-game.gd`'s own `_create_trade_publish_game()` and the month pass, rather than guessing one
+field at a time - the same way the proposal shape was fixed, but applied to the *released* record.
+
+## Also fixed
+
+- `theme_known()` was reading trends through `call()`, which returns nothing on these model nodes. An
+  inert guard, which is the failure it was written to prevent.
+- `run-coverage.ps1` now captures both instances' stderr, and the `state` verb reports a project's
+  `progress/game_duration`, `paused` and `staff` count - the numbers that decide whether it can advance.
+
+## Verified this pass
+
+- A project now **starts, advances and produces a released game** on both machines.
+- `28/28` build guards, including the new `as`-cast check and the native-killer suite proven both ways.
+- 16 relay cases, unchanged.
+- `theme_known` now actually answers, so a transplanted game keeps its theme when the world knows it.
+
+## Next
+
+1. Derive the complete field set a transplanted rival game needs, from `concurrent-game.gd`, and send all
+   of it. Then a release should stop killing the other machine.
+2. With that, reach a real `published` and the IP transfer, which are the last two unexercised paths.

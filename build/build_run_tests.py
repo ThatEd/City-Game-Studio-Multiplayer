@@ -142,6 +142,44 @@ MUST_PASS = [
 # rather than mixed into the compile-guard lists above: it must catch a function nothing calls, and it
 # must leave alone a function called through a receiver (`__link.debug_line()`), through `call()`, and
 # one that is genuinely never referenced but deliberately allowed.
+# The native-killer guard has its own list because it is checked by check_native_killers(), not by the
+# compile guards. Both directions matter: a cast this build cannot parse must be caught, and legitimate
+# uses of the same words must not be.
+NATIVE_MUST_CATCH = [
+    (
+        "an `as` cast, which does not parse here",
+        b"func f(list):\n"
+        b"\tvar size = (list as Array).size()\n"
+        b"\treturn size\n",
+        "a parse error leaves the previous version of the script running, so the mod looks healthy "
+        "while the edit is ignored",
+    ),
+    (
+        "dictionary get(), which kills this build",
+        b"func f(data):\n"
+        b"\treturn data.get(\"key\")\n",
+        "Dictionary.get() dereferences null at 0xae5633",
+    ),
+]
+
+
+NATIVE_MUST_PASS = [
+    (
+        "a string containing 'as'",
+        b"func f(catalog):\n"
+        b"\tvar names = []\n"
+        b"\tnames.push_back(\"was as if\")\n"
+        b"\treturn names\n",
+    ),
+    (
+        "a comparison that spells 'as' inside a word",
+        b"func f(value):\n"
+        b"\tvar has_copy = value\n"
+        b"\treturn has_copy\n",
+    ),
+]
+
+
 DEAD_MUST_CATCH = [
     (
         "a function nothing calls",
@@ -178,7 +216,6 @@ DEAD_MUST_PASS = [
 def main():
     passed = 0
     failed = []
-
     print("guards that must catch their mistake")
     for name, body, why in MUST_CATCH:
         problems = build_mod.check_missing_classes({"res://coop/probe.gd": body})
@@ -202,6 +239,25 @@ def main():
 
     total = len(MUST_CATCH) + len(MUST_PASS)
     print()
+    print("the native-killer guard")
+    for name, body, why in NATIVE_MUST_CATCH:
+        problems = build_mod.check_native_killers({"res://coop/probe.gd": body})
+        if problems:
+            passed += 1
+            print("  ok    %-32s %s" % (name, problems[0].split(": ", 1)[1][:64]))
+        else:
+            failed.append(name)
+            print("  FAIL  %-32s NOT CAUGHT - %s" % (name, why))
+    for name, body in NATIVE_MUST_PASS:
+        problems = build_mod.check_native_killers({"res://coop/probe.gd": body})
+        if problems:
+            failed.append(name)
+            print("  FAIL  %-32s false positive: %s" % (name, problems[0]))
+        else:
+            passed += 1
+            print("  ok    %-32s passes" % name)
+    total += len(NATIVE_MUST_CATCH) + len(NATIVE_MUST_PASS)
+    print()
     print("the dead-function guard")
     for name, body, why in DEAD_MUST_CATCH:
         problems = build_mod.check_dead_functions({"res://coop/probe.gd": body})
@@ -219,7 +275,8 @@ def main():
         else:
             passed += 1
             print("  ok    %-32s passes" % name)
-    total = len(MUST_CATCH) + len(MUST_PASS) + len(DEAD_MUST_CATCH) + len(DEAD_MUST_PASS)
+    total = (len(MUST_CATCH) + len(MUST_PASS) + len(DEAD_MUST_CATCH) + len(DEAD_MUST_PASS)
+             + len(NATIVE_MUST_CATCH) + len(NATIVE_MUST_PASS))
     print()
     print("%d/%d passed" % (passed, total))
     if failed:

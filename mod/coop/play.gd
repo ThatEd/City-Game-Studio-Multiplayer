@@ -128,11 +128,31 @@ static func __return_to_the_world(coop):
 	var screens_now = 0
 	if scene_manager.has_method("get_number_of_scene"):
 		screens_now = int(scene_manager.call("get_number_of_scene"))
+	# The game's own way out of a project screen.
+	#
+	# These screens are *protected*: `scene_manager.back()` refuses them (menu.gd passes
+	# `game_step != "kickoff"` as protect), and forcing it crashed the host at 0xae5633 by tearing a scene
+	# down mid-transition. A player gets out by pressing the screen's own Next or Cancel button, and both
+	# of those call one of two methods on the screen: `next_pressed()` steps the game and closes it,
+	# `cancel_pressed()` cancels and closes it. Calling those is the same transition the button makes -
+	# not a teardown invented here - and it is the only way a bot can finish a project.
+	#
+	# Without it no week ever passed while a project screen was open: `controllers/date.gd
+	# compute_state()` freezes the clock when a screen is on the stack, so a project sat at KICKOFF forever
+	# and nothing was ever released.
+	if screens_now > 0 and closed == false and coop.__play_screen_pressed < 2:
+		var popups = coop.get_tree().get_nodes_in_group("popup-node")
+		if popups.size() > 0:
+			var top = popups[popups.size() - 1]
+			if top != null and top.has_method("next_pressed"):
+				coop.__play_screen_pressed += 1
+				top.call("next_pressed")
+				closed = true
+				coop_log.info(coop.config.log_name, "play: pressed Next on [%s] the way a player does, so "
+					% [String(top.get_filename())] + "the clock can run again")
 	# What actually happened, not what was attempted. `back()` returns false and closes nothing when the
-	# open screen is *protected*, and the project screens all are (menu.gd passes
-	# `game_step != "kickoff"` as protect): the game requires the player to confirm them, so a bot cannot
-	# dismiss one and neither can this. Reporting "closed a game screen" while `screens` stayed at 1 was a
-	# false claim in the log for a whole pass.
+	# open screen is *protected*, and every project screen after kickoff is. Reporting "closed a game
+	# screen" while `screens` stayed at 1 was a false claim in the log for a whole pass.
 	if closed or screens_now < 1:
 		coop_log.info(coop.config.log_name, "play: closed a gated screen (view_mode=%s, %s left)" % [
 			__view_mode_text(), String(screens_now)

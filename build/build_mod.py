@@ -694,6 +694,15 @@ def check_native_killers(files):
                     f"{name}:{number}: Array.extend() does not exist in this build "
                     "(0xc0000005); push_back in a loop instead"
                 )
+            # `x as Array` is Godot 4. In this build it is a parse error - and a parse error does not fail
+            # the build here, it silently leaves the previous version of the script running, so the whole
+            # mod looks healthy while the edited file is ignored. That is how a diagnostic written to
+            # `state` made the game fail to start at all with only "verify: never ran" in its own log.
+            if re.search(r"\bas\s+(Array|Dictionary|String|int|float|bool)\b", code):
+                problems.append(
+                    f"{name}:{number}: `as` casts do not exist in this build (parse error, and a "
+                    "parse error leaves the old script running); use typeof() or a plain assignment"
+                )
     return problems
 
 
