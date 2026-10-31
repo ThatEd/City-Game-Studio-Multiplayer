@@ -89,10 +89,6 @@ const COMPANY_MODELS = ["player", "staff", "currency", "fanbase", "game",
 const PING_INTERVAL = 2.0
 # How often a client re-applies the competitor mute.
 const MUTE_INTERVAL = 5.0
-# How many times a client re-checks its home-office count before giving up. The game places its own first
-# studio some seconds after the models load, so one attempt is a race; twenty seconds of re-checks is well
-# past that without leaving a timer running for the whole session.
-const SINGLE_HOME_TRIES = 5
 # How long the buy test waits for the other player's company to appear before it says so. A joining
 # player's company arrives with the world transfer and then the company table, which is seconds, not
 # frames; warning on frame one (which is what a never-assigned 0.0 did) reports a healthy world as empty.
@@ -1771,9 +1767,11 @@ var __play_view_noted = false
 var __play_screen_since = -1.0
 # When to collapse this client's home offices down to one, or -1 for never. See __finish_join.
 var __single_home_at = -1.0
-var __single_home_tries = 0
+var __single_home_clean_since = -1.0
+var __single_home_quiet = false
 var __play_gated_noted = false
 var __play_release_noted = false
+var __play_ip_offered = false
 
 var __play_frozen_warned = false
 var __play_was_frozen = false
@@ -2461,25 +2459,33 @@ func __tick_single_home():
 		return
 	if __elapsed < __single_home_at:
 		return
-	# Retried, not done once.
+	# Retried for a while, not once.
 	#
-	# The host's version re-checks for a while for exactly this reason: the game's own placement happens
-	# after the models load, so a single attempt three seconds in sees one home office and concludes there
-	# is nothing to do - and the second one arrives afterwards. That is how a fix that passed two runs let
-	# the same assertion fail again in a longer one. It now re-checks every few seconds until the count is
-	# stable at one, and gives up after a bounded number of attempts.
-	__single_home_at = __elapsed + 4.0
-	__single_home_tries += 1
-	var before = company.home_office_count()
-	if before <= 1:
-		if __single_home_tries >= SINGLE_HOME_TRIES:
-			__single_home_at = -1.0
+	# The host's version re-checks for exactly this reason: the game creates its own studios some seconds
+	# after the models load, so an early attempt sees one home office, concludes there is nothing to do, and
+	# the extras appear afterwards. A bounded number of attempts was still not enough - a long run reached
+	# three home offices because they arrived later than the last attempt.
+	#
+	# So this keeps checking for a fixed span rather than a fixed count, which is what the host's
+	# `__elapsed > 25.0` fence effectively does, and stops early once the count is one and has *stayed*
+	# one for a while.
+	__single_home_at = __elapsed + 5.0
+	var count = company.home_office_count()
+	if count > 1:
+		var closed = company.ensure_single_home("")
+		if closed > 0 or not __single_home_quiet:
+			__single_home_quiet = true
+			coop_log.info(config.log_name, "office: client clean-up closed %s, %s home office(s) left" % [
+				String(closed), String(company.home_office_count())
+			])
+		__single_home_clean_since = -1.0
 		return
-	var closed = company.ensure_single_home("")
-	coop_log.info(config.log_name, "office: client clean-up closed %s, %s home office(s) left" % [
-		String(closed), String(company.home_office_count())
-	])
-	if company.home_office_count() <= 1 or __single_home_tries >= SINGLE_HOME_TRIES:
+	# One home office: hold that for ten seconds before standing down, because the next one can still be
+	# on its way.
+	if __single_home_clean_since < 0.0:
+		__single_home_clean_since = __elapsed
+		return
+	if __elapsed - __single_home_clean_since >= 10.0:
 		__single_home_at = -1.0
 
 

@@ -2748,3 +2748,85 @@ the assertion that used to fail. Also passed a 480-second run.
 Two of the three things here are corrections of my own work: a "fixed" bug that a longer run disproved, and a
 single-shot action that needed to retry. Both were caught by running longer rather than by reasoning harder -
 the same lesson the harness itself has been teaching since the beginning.
+
+---
+
+# Pass 35: the IP transfer, and the home office fixed for real
+
+**Every trade kind has now been exercised.** The IP transfer was the last one, and it works end to end.
+
+## The IP transfer
+
+```
+host:   trade: sent coop-highland offered the IP of Coop Test 33016
+host:   trade: the IP of Coop Test 33016 is no longer ours to sell
+host:   trade: our side of offer-coop-highland-… applied (gave up IP Coop Test 33016)
+
+client: trade: coop-highland offered the IP of Coop Test 33016
+client: trade: acquired the IP of Coop Test 33016
+client: trade: accepted coop-highland offered the IP of Coop Test 33016 (IP Coop Test 33016)
+```
+
+And the receiving machine really holds it:
+
+```
+hold: Coop Test 33016 step=AWARD progress=21/21 paused=False staff=1
+```
+
+The wire shows the whole exchange - `offer`, `offer_request`, `offer_accept`, `offer_accepted` - from both
+ends, in a single run. The giver's game moves from `published` to `discontinued`, which is what the game itself
+does with a title it no longer sells; the receiver holds the IP in `hold` and does not publish it as theirs, so
+it cannot double-count sales it did not make.
+
+### Why it had never run
+
+Not a fault. `ui_published_games()` was correct and the panel was honest: `[games] has no published game`. The
+requirement is that the *offering* machine holds a game in the `published` bucket, which only happens some
+minutes after a release - by which time the playtest's action list had finished. Three long runs reached
+`published=1` and then ended before their turn.
+
+The bot now offers the IP **as soon as a published game exists**, ahead of the remaining scripted actions,
+because that is the right moment for it rather than a new kind of action. That is the only change it needed.
+
+## The home office, third attempt
+
+This is the second time I have reported this fixed and been wrong, so the reason matters.
+
+- Attempt one ran the clean-up **once**, three seconds after the join. Passing runs sampled before the second
+  office existed.
+- Attempt two re-checked five times over twenty seconds. A 20-minute run then reached **three** home offices -
+  they were still arriving after the last attempt.
+- Attempt three watches for a **span**, not a count: it re-checks every five seconds for as long as it takes,
+  and stands down only once the count has been one for ten seconds running. That is what the host's
+  `__elapsed > 25.0` fence effectively does, and it is the difference between sampling a moment and observing a
+  period.
+
+Verified on an 18-minute run - longer than the one that failed:
+
+```
+host:   verify: 30 passed, 0 failed -> ALL OK
+client: verify: 30 passed, 0 failed -> ALL OK
+```
+
+## Verified this pass
+
+| | |
+|---|---|
+| **IP transfer** | offered, acquired, accepted; both sides applied; receiver holds it |
+| Trade kinds exercised | **all four**: money, technology, IP, and the accept/refuse paths |
+| Home offices | one, on client and host, at 15 min and at 18 min |
+| Build guards | 28/28 |
+| Relay cases | 16/16 |
+
+## Still open
+
+- **`logo`** is unsendable: `company.logo()` returns null because the player model has no `company_logo` key.
+  This is a missing field in the game's own data, not a fault in the mod - it cannot be exercised without
+  inventing a logo the game would never produce.
+- **`acquired`** is refused by the buyout guard by design (a player company cannot be bought out), so it has
+  never been sent and should not be.
+- **`session_request`** is handled and sent by nothing.
+- **The lobby's five buttons** have only ever run through `--coop-autojoin`; the lobby itself has been
+  photographed but its controls have not been pressed by an automated run.
+- **The publish-offer list and console panel** have never been looked at as *rendered* panels - the assertions
+  read model values, so a panel that displayed them wrongly would still pass.

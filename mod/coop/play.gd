@@ -26,7 +26,8 @@ const trade = preload("res://coop/trade.gd")
 
 # The actions, in order. Each is attempted once; if the game is not ready for it, it is retried on the
 # next tick rather than skipped, so a slow join cannot silently drop a step.
-const ACTIONS = ["project", "office", "furnish", "research", "project2", "office2", "release", "release2"]
+const ACTIONS = ["project", "office", "furnish", "research", "project2", "office2", "release", "release2",
+	"offer_ip", "offer_ip2"]
 
 const ACTION_INTERVAL = 90.0
 const CHECK_INTERVAL = 60.0
@@ -82,7 +83,17 @@ static func tick(coop):
 	# actions are skipped and only the cross-checking half of this file runs.
 	if now >= coop.__play_next_action and coop.config.pilot <= 0.0:
 		coop.__play_next_action = now + ACTION_INTERVAL
-		__next_action(coop)
+		# Once a published game exists, offering its IP takes priority over the remaining scripted actions.
+		#
+		# The action list is a sequence, and by the time `offer_ip` came round the run was usually over: a
+		# game only reaches `published` some minutes after a release, which is past the point the list
+		# finishes. That made the last untested trade kind unreachable in practice even though every part of
+		# its path worked. It is not a new kind of action, just the right moment for it.
+		if coop.config.play_release and not coop.__play_ip_offered and __has_published_game(coop):
+			if __action_offer_ip(coop):
+				coop.__play_ip_offered = true
+		else:
+			__next_action(coop)
 	if coop.config.pilot > 0.0 and coop.__play_next_action > 0.0:
 		coop.__play_next_action = now + ACTION_INTERVAL
 	if now >= coop.__play_next_check:
@@ -615,6 +626,16 @@ static func __next_action(coop):
 		done = __action_furnish(coop)
 	elif action == "research":
 		done = __action_research(coop)
+	elif action == "offer_ip" or action == "offer_ip2":
+		if not coop.config.play_release:
+			coop.__play_action += 1
+			return
+		done = __action_offer_ip(coop)
+		# Held like the release, for the same reason: a published game exists only after a release has had
+		# time to move out of `released`, so the first attempt usually finds nothing.
+		if not done:
+			coop.__play_action -= 1
+
 	elif action == "release" or action == "release2":
 		# Off by default: publishing a game makes this company's game list change on the wire, and
 		# something in the rival-game path crashes this engine build natively (0xc0000005 at 0xae5633,
@@ -894,6 +915,38 @@ static func __action_release(coop):
 
 
 # Another office, on an empty applicable building, the same way the first one was made.
+static func __has_published_game(coop):
+	var catalog = models.get_model("game").get_data()["catalog"]
+	if not catalog.has("published") or catalog["published"] == null:
+		return false
+	return catalog["published"].size() > 0
+
+
+# Offers the IP of this company's best published game to the other player.
+#
+# This is the last trade kind that had never been exercised, and the reason was structural rather than a
+# fault: it needs the *offering* machine to hold a game in the `published` bucket, which only happens some
+# minutes after a release. A hand-driven run reached the panel and found `[games] has no published game`,
+# which was honest but left the path untested. The bot tries, and holds its slot until it can.
+static func __action_offer_ip(coop):
+	var catalog = models.get_model("game").get_data()["catalog"]
+	if not catalog.has("published") or catalog["published"] == null or catalog["published"].size() == 0:
+		return false
+	var other = ""
+	for player_id in coop.ui_other_players():
+		other = String(player_id)
+		break
+	if other == "":
+		return false
+	for game_id in catalog["published"]:
+		coop.offer_ip(other, String(game_id))
+		coop_log.info(coop.config.log_name, "play: offered the IP of [%s] to %s" % [
+			String(game_id), other
+		])
+		return true
+	return false
+
+
 static func __action_office(coop):
 	var tile = company.find_empty_office()
 	if tile == null:
