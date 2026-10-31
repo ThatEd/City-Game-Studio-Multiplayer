@@ -1,3 +1,10 @@
+> **Which build these results describe.** Everything below was measured on Steam `buildid` **25723493**
+> (game v1.28.1). Steam has since installed an **unstable build, `buildid` 25961418**, which has been checked
+> only for the basics: the mod builds against it, boots, and reaches a live game (see
+> [docs/NOTES.md](docs/NOTES.md) pass 38). Its scripts are now **encrypted** (`GDEC`, `FileAccessEncryptedv3`,
+> 32-byte key) and **0 of 932 decompile**, so what its new features do cannot be read - only observed through the
+> live models. Treat every detailed claim in this README as belonging to the older build until re-verified.
+
 # City Game Studio Multiplayer
 
 Competitive co-op for **City Game Studio** — one player hosts their save, a second joins over a relay

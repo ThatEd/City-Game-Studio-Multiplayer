@@ -2997,3 +2997,107 @@ needs and it has not been run — the single-client harness cannot reach it.
   **`session_request`** sent by nothing.
 - **Rendered panels**: the publish-offer list and console panel have never been looked at as pixels.
 - **`lobby_cancel_pressed`** is deliberately not pressed in a run: it disconnects the client and ends the test.
+
+---
+
+# Pass 38: the unstable build — what actually changed, and what it blocks
+
+The Steam install was updated while this project was mid-flight. Recorded first, before touching anything,
+because a write-up that does not match the installed build is worthless.
+
+## GAME IDENTITY (new, replaces the old one)
+
+| | |
+|---|---|
+| Steam `buildid` | **25961418** (was 25723493) |
+| `appmanifest` LastUpdated | 2026-10-31 23:56 local |
+| `CityGameStudio64.exe` | 17,027,584 bytes, SHA-256 `62B84148F31AAC20AA544D32DA62F2293888474D40A5BB28C582A4C690845EC1` |
+| `data.pck` | 376,412,006 bytes |
+| Engine | Godot 2.1.0, bytecode revision 2.1.3-stable (ed80f45) - unchanged |
+| Layout | exe + `data.pck` + `steam_api64.dll` + `discord-rpc.dll` + **`send-presence.exe`** |
+
+## The finding that matters: the scripts are now encrypted
+
+```
+ERROR: Condition "p_key.size() != 32" is true. Returning: ERR_INVALID_PARAMETER
+   at: FileAccessEncryptedv3::open_and_parse
+WARNING: Could not determine bytecode revision, not able to decompile scripts...
+Decompiled scripts:                     0
+Scripts not decompiled:                 932
+Failed to decompile encrypted scripts! Set the correct key and try again!
+```
+
+Every `.gde` in the pack begins `GDEC` and must be opened by `FileAccessEncryptedv3` with a **32-byte key**. GDRE
+Tools v2.7.4 - the version that produced `src/` for the previous build - cannot read any of them without that key.
+
+So the previous build's `.gde` files *were* the encrypted format too, but this project already had a plain-text
+`src/` tree (925 files) from an earlier decompilation, and every guard, every `check_*` and every "I read
+`controllers/game.gd`" in these notes has been against **that** tree. That tree still describes the *old* build.
+
+What this means concretely: **the source of the new build's scripts is not readable by me.** Any claim about how
+its features work would be a guess, and this playbook forbids that.
+
+## What IS readable
+
+- `engine.cfb` (project config, `ECFG`) - the same format `build_mod.py` already parses. Autoloads, main scene,
+  input mappings. This is what an autoloaded mod needs.
+- `scenes/*.scn` - binary `RSRC`, but the node tree, resource paths and **script paths** are plain ASCII inside
+  it. Enough to know which script backs which scene, not what it does.
+- Everything else (assets, themes, fonts, translations) as before.
+
+## The headline, tested rather than assumed
+
+**The existing mod builds, boots and reaches a live game on the unstable build.**
+
+```
+INFO coop mod 0.1.0 booted
+INFO compile: res://coop/remote.gd ok  ... (every mod script compiles)
+INFO menu: multiplayer entry added to the left of the game's own entries
+INFO selftest: game state is loaded
+INFO selftest: ready
+```
+
+`build_mod.py` copied the new pack, injected the mod, updated the autoload list and re-verified the MD5s. The
+mod's own files are plain GDScript and are unaffected by the encryption - which only covers the *game's* scripts.
+
+Also unchanged on this build, and still absent: `TCPServer`, `NetworkedMultiplayerPeer`, `NetworkedMultiplayerENet`
+and `JSON` are all MISSING, so the off-game relay is still necessary and nothing about the networking model
+changes.
+
+## A correction to my own first reading
+
+I initially reported the mod system ("Build a mod", `scenes/mod/`, `mod-manager`) as a new feature of the unstable
+build. **It is not.** `src/scenes/mod/` and `src/scenes/mod-manager.tscn` exist in the old build too. The unstable
+build may well change it, but I cannot read the scripts to say how, so I am not claiming anything about it.
+
+## Where this leaves "work with its new features"
+
+Three honest options, and the first one is a question for the owner rather than something I should decide:
+
+1. **Get the key.** If the unstable build's scripts are encrypted with a key the owner has or can obtain (the
+   developer's own tooling, a beta branch note, or the key compiled into the exe), everything opens up. Without
+   it, "its new features" cannot be read, only observed.
+2. **Work behaviourally.** The mod still loads, and the game still exposes its models and controllers *at runtime*.
+   The `remote` channel (`own`, `state`, `clock`, `trends`, `research`, `pick`) can enumerate what a feature does
+   by inspecting the live models, without reading a line of its source. Slower and weaker than reading code, but
+   real - and it is how the lobby's fault was found.
+3. **Stay on the old build** for the verified work until the unstable one is readable, and treat the new build as
+   "loads, not yet characterised".
+
+I have not changed any mod logic for the new build, because I cannot see what changed. Recording that is more
+useful than a plausible-looking guess.
+
+## What is verified about the new build
+
+| | |
+|---|---|
+| Mod builds against it | yes - pack copied, injected, MD5s verified |
+| Mod boots | yes - `coop mod 0.1.0 booted`, all scripts compile |
+| Reaches a live game | yes - `selftest: game state is loaded`, `ready` |
+| Game scripts readable | **no** - 0 of 932, encrypted with a 32-byte key |
+| Networking classes | unchanged - `TCPServer` etc. still absent |
+
+## Next
+
+Ask for the key, or characterise the new features behaviourally through the live models. Everything in these
+notes up to pass 37 describes the **previous** build (`25723493`) and should be read that way until re-verified.
