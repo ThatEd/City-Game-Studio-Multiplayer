@@ -2671,3 +2671,80 @@ with 1 office(s)` - the exact case that used to leave two. **Both machines 30 pa
 - **`logo`** is still unsendable: the player model has no `company_logo`, so `company.logo()` returns null.
 - **`acquired`** is refused by the buyout guard by design; **`session_request`** is sent by nothing.
 - **The lobby's five buttons** have only ever run through `--coop-autojoin`.
+
+---
+
+# Pass 34: `published`, and a fix that did not hold
+
+## A game reached `published`
+
+Last pass recorded `published` as an open question: nothing had moved a game from `released` to `published`,
+and it was not established what does. This pass found out - it is simply time. A released game keeps selling
+and moves on by itself:
+
+```
+play: pressed Release on [Coop Test 33355], as the project card's own button does
+play: a game is on sale (published=0 released=1 hold=0 dev=0)     <- four minutes later
+play: a game is on sale (published=1 released=0 hold=0 dev=0)
+```
+
+No action does it. `released` is the state a self-published game enters, and `published` is where it ends up.
+The published game then crossed the wire (`games_sent=1` on the other machine) with no crash, which exercises
+the `0xae5633` fix against a record in *that* bucket too.
+
+## The release retry
+
+`__action_release` used to be attempted once, at about seven minutes into a playtest, and then the action list
+moved on. A project needs a full design/development/polish cycle - minutes of in-game weeks - so the single
+attempt usually found nothing in HOLD, and the playtest finished with `released=0` on a machine whose project
+was two minutes short. The release action now holds its slot and retries, which is what got the host to a
+release in the run above:
+
+```
+play: nothing in HOLD to release yet, will keep trying
+```
+
+## The fix from last pass did not hold
+
+Last pass reported the two-home-office bug fixed, on two runs that both passed 30/30. A longer run then failed
+the same assertion again:
+
+```
+verify FAIL only one home office, however many times this player joined (2 home office(s))
+```
+
+The fix ran **once**, three seconds after the join. The game places its own first studio some seconds after the
+models load, so three seconds in there was one home office, the cleanup concluded there was nothing to do, and
+the second one arrived afterwards. Two passing runs had simply sampled before the second office existed - which
+is the same mistake as a test that sleeps and hopes, made inside the mod rather than the harness.
+
+`__tick_single_home()` now re-checks every four seconds up to five times, exactly as the host's version has
+always re-checked, and stops as soon as the count is one or the attempts are spent.
+
+Verified on a 900-second run: **30 passed, 0 failed on both machines**, with the client's own verify reaching
+the assertion that used to fail. Also passed a 480-second run.
+
+## Verified this pass
+
+| | |
+|---|---|
+| A game reaching `published` | `published=1`, and it crossed the wire |
+| Release retry | host reached a release after retrying |
+| Two home offices | fixed *properly*; 30/30 both machines at 480 s and at 900 s |
+| Build guards | 28/28 |
+| Relay cases | 16/16 |
+
+## Still open
+
+- **The IP transfer.** It needs the *offering* player to hold a published game of their own, and the panel says
+  so honestly (`[games] has no published game`) because neither machine had published *and* offered in the
+  same run. Both halves now work; it needs one run that does both.
+- **`logo`** is unsendable: `company.logo()` returns null because the player model has no `company_logo`.
+- **`acquired`** is refused by the buyout guard by design; **`session_request`** is sent by nothing.
+- **The lobby's five buttons** have only ever run through `--coop-autojoin`.
+
+## A note on how this pass went wrong
+
+Two of the three things here are corrections of my own work: a "fixed" bug that a longer run disproved, and a
+single-shot action that needed to retry. Both were caught by running longer rather than by reasoning harder -
+the same lesson the harness itself has been teaching since the beginning.

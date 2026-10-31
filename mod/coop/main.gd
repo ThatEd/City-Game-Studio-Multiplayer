@@ -89,6 +89,10 @@ const COMPANY_MODELS = ["player", "staff", "currency", "fanbase", "game",
 const PING_INTERVAL = 2.0
 # How often a client re-applies the competitor mute.
 const MUTE_INTERVAL = 5.0
+# How many times a client re-checks its home-office count before giving up. The game places its own first
+# studio some seconds after the models load, so one attempt is a race; twenty seconds of re-checks is well
+# past that without leaving a timer running for the whole session.
+const SINGLE_HOME_TRIES = 5
 # How long the buy test waits for the other player's company to appear before it says so. A joining
 # player's company arrives with the world transfer and then the company table, which is seconds, not
 # frames; warning on frame one (which is what a never-assigned 0.0 did) reports a healthy world as empty.
@@ -1767,7 +1771,9 @@ var __play_view_noted = false
 var __play_screen_since = -1.0
 # When to collapse this client's home offices down to one, or -1 for never. See __finish_join.
 var __single_home_at = -1.0
+var __single_home_tries = 0
 var __play_gated_noted = false
+var __play_release_noted = false
 
 var __play_frozen_warned = false
 var __play_was_frozen = false
@@ -2451,16 +2457,30 @@ func __tick_takeover_reseat():
 # `open_first_studio` registers a studio as part of a call and the studio model has not caught up
 # immediately afterwards.
 func __tick_single_home():
-	if __single_home_at < 0.0 or __elapsed < __single_home_at:
+	if __single_home_at < 0.0:
 		return
-	__single_home_at = -1.0
+	if __elapsed < __single_home_at:
+		return
+	# Retried, not done once.
+	#
+	# The host's version re-checks for a while for exactly this reason: the game's own placement happens
+	# after the models load, so a single attempt three seconds in sees one home office and concludes there
+	# is nothing to do - and the second one arrives afterwards. That is how a fix that passed two runs let
+	# the same assertion fail again in a longer one. It now re-checks every few seconds until the count is
+	# stable at one, and gives up after a bounded number of attempts.
+	__single_home_at = __elapsed + 4.0
+	__single_home_tries += 1
 	var before = company.home_office_count()
 	if before <= 1:
+		if __single_home_tries >= SINGLE_HOME_TRIES:
+			__single_home_at = -1.0
 		return
 	var closed = company.ensure_single_home("")
 	coop_log.info(config.log_name, "office: client clean-up closed %s, %s home office(s) left" % [
 		String(closed), String(company.home_office_count())
 	])
+	if company.home_office_count() <= 1 or __single_home_tries >= SINGLE_HOME_TRIES:
+		__single_home_at = -1.0
 
 
 # Whether this run skips the lobby.

@@ -624,6 +624,18 @@ static func __next_action(coop):
 			coop.__play_action += 1
 			return
 		done = __action_release(coop)
+		# A release is the one action worth waiting for rather than stepping past.
+		#
+		# A project has to sit in HOLD before it can be released, and it only gets there after a full
+		# design, development and polish cycle - minutes of in-game weeks. The action list reaches
+		# `release` at about seven minutes, when the first project is often still in `dev`, so a single
+		# attempt did nothing and the playtest then moved on to `release2` and finished with
+		# `released=0`. Holding the action slot keeps trying until it succeeds or the playtest ends.
+		if not done and not coop.__play_stuck.has(action):
+			coop.__play_action -= 1
+			if not coop.__play_release_noted:
+				coop.__play_release_noted = true
+				coop_log.info(coop.config.log_name, "play: nothing in HOLD to release yet, will keep trying")
 	if done:
 		coop.__play_actions.push_back(action)
 		coop.__play_action += 1
